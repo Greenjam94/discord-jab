@@ -1,5 +1,10 @@
+#Venv
+.venv/
+
 #DOTENV
 .env
 
 #PYCACHE
 __pycache__/
+
+TODO.md

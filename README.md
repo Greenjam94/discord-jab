@@ -1,5 +1,26 @@
 # Dev setup
 
+## Windows specific
+
+1. Install visual stuio code
+2. Setup Git 
+3. Git clone this repo to a folder
+4. Follow https://code.visualstudio.com/docs/python/python-tutorial to set up python environment on windows
+
+## Python Setup
+Set up virtual env
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Windows alterative
+```
+py -3 -m venv .venv
+.venv\scripts\activate
+```
+
 Install required dependencies
 
 ```
