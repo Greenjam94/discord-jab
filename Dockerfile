@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 python:3.9-slim
+FROM --platform=linux/amd64 python:3.10-slim
 
 # Set pip to have cleaner logs and no saved cache
 ENV PIP_NO_CACHE_DIR=false \
@@ -10,7 +10,7 @@ RUN pip install --upgrade poetry
 WORKDIR /bot
 
 # Copy dependencies and lockfile
-# COPY pyproject.toml poetry.lock /bot/
+COPY pyproject.toml poetry.lock /bot/
 
 # Install dependencies and lockfile, excluding development
 # dependencies,
