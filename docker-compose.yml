@@ -13,19 +13,8 @@ services:
     init: true
     tty: true
 
-    depends_on:
-      - redis
-
-    environment:
-      - REDIS_HOST=redis
     env_file:
       - .env
 
     volumes:
       - .:/bot
-
-  redis:
-    << : *restart_policy
-    image: redis:latest
-    ports:
-      - "127.0.0.1:6379:6379"

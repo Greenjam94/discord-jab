@@ -8,6 +8,8 @@ authors = ["James Green <Greenjam94@gmail.com>"]
 python = "^3.10"
 python-dotenv = "^0.20.0"
 "discord.py" = "^1.7.3"
+async-rediscache = "^0.2.0"
+aiodns = "^3.0.0"
 
 [tool.poetry.dev-dependencies]
 
