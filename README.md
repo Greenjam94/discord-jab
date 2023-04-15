@@ -3,12 +3,14 @@
 ## Windows specific
 
 1. Install visual stuio code
-2. Setup Git 
-3. Git clone this repo to a folder
-4. Follow https://code.visualstudio.com/docs/python/python-tutorial to set up python environment on windows
+2. Install Docker Desktop
+3. Setup Git 
+4. Git clone this repo to a folder
+5. Follow https://code.visualstudio.com/docs/python/python-tutorial to set up python environment on windows
 
-## Python Setup
-Set up virtual env
+# Project Setup
+
+1. Set up virtual env
 
 ```
 python3 -m venv .venv
@@ -21,7 +23,7 @@ py -3 -m venv .venv
 .venv\scripts\activate
 ```
 
-Install required dependencies
+2. Install required dependencies
 
 ```
 python3 -m pip install -U discord.py
@@ -35,22 +37,20 @@ pip3 install python-dotenv
 pip3 install discord.py
 ```
 
-Go to discord developer portal and get a token from the bot page
+3. Go to discord developer portal and get a token from the bot page
 https:// discord. com/developers/applications/your-app-id-here/bot
 
-Create a .env file setting with a `BOT_TOKEN` env variable
+4. Create a .env file setting with a `BOT_TOKEN` env variable
 ```
 BOT_TOKEN=replace_me1234567890
 ```
 
-# Running the Bot
-`python3 jab-commands.py`
+## Troubleshooting
 
-# Functions
+poetry is a package management tool, if pyproject.toml is changed, make sure the .lock files is updated by running `poetry lock` if the command is not recognized then run `pip install --upgrade poetry`
 
-- `!test arg1 arg2` Tells you the first two parameters, errors if fewer are given
-- `!add int1 int2` Adds two numbers together
-- `!scream *` Converts to ALL CAPS
-- `!slap user reason` says "$user just got slapped for $reason"
+Packages have locked versions... they may need to be updated
 
-Two prompts can be used, ! or ?
+# Running the Bot on Docker
+`docker-compose up -d --build`
+

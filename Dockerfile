@@ -14,7 +14,7 @@ COPY pyproject.toml poetry.lock /bot/
 
 # Install dependencies and lockfile, excluding development
 # dependencies,
-RUN poetry install --no-dev --no-interaction --no-ansi
+RUN poetry install --only main --no-interaction --no-ansi
 
 # Set SHA build argument
 ARG git_sha="development"
