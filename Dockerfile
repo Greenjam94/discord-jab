@@ -7,10 +7,10 @@ ENV PIP_NO_CACHE_DIR=false \
 # Install Poetry
 RUN pip install --upgrade poetry
 
-WORKDIR /bot
+WORKDIR /jab
 
 # Copy dependencies and lockfile
-COPY pyproject.toml poetry.lock /bot/
+COPY pyproject.toml poetry.lock /jab/
 
 # Install dependencies and lockfile, excluding development
 # dependencies,
@@ -20,8 +20,5 @@ RUN poetry install --only main --no-interaction --no-ansi
 ARG git_sha="development"
 ENV GIT_SHA=$git_sha
 
-# Copy the rest of the project code
-COPY . .
-
 # Start the bot
-CMD ["python", "-m", "bot"]
+CMD ["python", "-m", "jab"]

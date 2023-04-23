@@ -17,4 +17,4 @@ services:
       - .env
 
     volumes:
-      - .:/bot
+      - .:/jab

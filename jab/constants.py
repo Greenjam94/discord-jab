@@ -7,7 +7,7 @@ from os import environ
 from typing import NamedTuple
 
 __all__ = (
-    "Client",
+    "BotConstants",
     "Logging",
     "ERROR_REPLIES",
     "NEGATIVE_REPLIES",
@@ -16,7 +16,7 @@ __all__ = (
 
 log = logging.getLogger(__name__)
 
-class Client(NamedTuple):
+class BotConstants(NamedTuple):
     name = "Jab"
     prefix = os.getenv("PREFIX", "!")
     token = os.getenv("BOT_TOKEN")
@@ -25,7 +25,7 @@ class Client(NamedTuple):
     github_bot_repo = "https://github.com/Greenjam94/discord-jab"
 
 class Logging(NamedTuple):
-    debug = Client.debug
+    debug = BotConstants.debug
     file_logs = os.getenv("FILE_LOGS", "false").lower() == "true"
     trace_loggers = os.getenv("BOT_TRACE_LOGGERS")
 
