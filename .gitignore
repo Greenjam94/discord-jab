@@ -10,4 +10,5 @@ venv/
 .idea/
 .vscode/
 *.log
-data/torn_keys.json
+data/
+scripts/
