@@ -1,8 +1,9 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import asyncio
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 # Load environment variables from .env file
 load_dotenv()
@@ -169,9 +170,114 @@ async def sync_commands_with_validation(bot: commands.Bot):
         import traceback
         traceback.print_exc()
 
+@tasks.loop(hours=24)  # Check daily
+async def monthly_summarization_task():
+    """Background task to run monthly summarization on the 1st of each month."""
+    if not hasattr(bot, 'database') or not bot.database:
+        return
+    
+    now = datetime.utcnow()
+    
+    # Only run on the 1st of the month
+    if now.day != 1:
+        return
+    
+    # Calculate previous month
+    if now.month == 1:
+        prev_year = now.year - 1
+        prev_month = 12
+    else:
+        prev_year = now.year
+        prev_month = now.month - 1
+    
+    print(f'📊 Starting monthly summarization for {prev_year}-{prev_month:02d}...')
+    
+    try:
+        # Create backup before summarization
+        try:
+            backup_path = await bot.database.backup()
+            print(f'✅ Backup created: {backup_path}')
+        except Exception as backup_error:
+            print(f'⚠️  Backup failed: {backup_error}')
+        
+        # Summarize player stats
+        try:
+            summaries = await bot.database.summarize_player_stats_monthly(prev_year, prev_month)
+            print(f'✅ Created {summaries} player stats summaries for {prev_year}-{prev_month:02d}')
+        except Exception as e:
+            print(f'⚠️  Player stats summarization failed: {e}')
+        
+        # Summarize faction history
+        try:
+            summaries = await bot.database.summarize_faction_history_monthly(prev_year, prev_month)
+            print(f'✅ Created {summaries} faction history summaries for {prev_year}-{prev_month:02d}')
+        except Exception as e:
+            print(f'⚠️  Faction history summarization failed: {e}')
+        
+        # Summarize territory ownership
+        try:
+            summaries = await bot.database.summarize_territory_ownership_monthly(prev_year, prev_month)
+            print(f'✅ Created {summaries} territory ownership summaries for {prev_year}-{prev_month:02d}')
+        except Exception as e:
+            print(f'⚠️  Territory ownership summarization failed: {e}')
+        
+        # TODO: Add war status summarization when method is implemented
+        # await bot.database.summarize_war_status_monthly(prev_year, prev_month)
+        
+        # Prune old records (older than 2 months)
+        try:
+            pruned = await bot.database.prune_player_stats_history(older_than_days=60)
+            print(f'✅ Pruned {pruned} old player stats records')
+        except Exception as e:
+            print(f'⚠️  Player stats pruning failed: {e}')
+        
+        try:
+            pruned = await bot.database.prune_faction_history(older_than_days=60)
+            print(f'✅ Pruned {pruned} old faction history records')
+        except Exception as e:
+            print(f'⚠️  Faction history pruning failed: {e}')
+        
+        try:
+            pruned = await bot.database.prune_territory_ownership_history(older_than_days=60)
+            print(f'✅ Pruned {pruned} old territory ownership records')
+        except Exception as e:
+            print(f'⚠️  Territory ownership pruning failed: {e}')
+        
+        # TODO: Add pruning for war status when method is implemented
+        
+        print(f'✅ Monthly summarization completed for {prev_year}-{prev_month:02d}')
+        
+    except Exception as e:
+        print(f'❌ Monthly summarization error: {e}')
+        import traceback
+        traceback.print_exc()
+
+@monthly_summarization_task.before_loop
+async def before_monthly_task():
+    """Wait until bot is ready before starting the task."""
+    await bot.wait_until_ready()
+    # Wait until next hour to avoid running immediately on startup
+    await asyncio.sleep(3600)  # Wait 1 hour
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
+    
+    # Initialize database
+    try:
+        from database import TornDatabase
+        bot.database = TornDatabase()
+        await bot.database.connect()
+        print('✅ Database initialized and connected')
+    except ImportError as e:
+        print(f'❌ Failed to import database module: {e}')
+        print('   Make sure aiosqlite is installed: pip install aiosqlite>=0.19.0')
+        bot.database = None
+    except Exception as e:
+        print(f'⚠️  Failed to initialize database: {e}')
+        import traceback
+        traceback.print_exc()
+        bot.database = None
     
     # Load command modules
     try:
@@ -196,10 +302,35 @@ async def on_ready():
     
     # Sync commands with validation
     await sync_commands_with_validation(bot)
+    
+    # Start monthly summarization task
+    if bot.database:
+        monthly_summarization_task.start()
+        print('✅ Monthly summarization task started')
+
+@bot.event
+async def on_disconnect():
+    """Cleanup on bot disconnect."""
+    if hasattr(bot, 'database') and bot.database:
+        await bot.database.close()
+        print('Database connection closed')
 
 # Run the bot
 if __name__ == "__main__":
     token = os.getenv('DISCORD_BOT_TOKEN')
     if not token:
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
-    bot.run(token)
+    try:
+        bot.run(token)
+    finally:
+        # Ensure database is closed on exit
+        if hasattr(bot, 'database') and bot.database:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(bot.database.close())
+                else:
+                    loop.run_until_complete(bot.database.close())
+            except:
+                pass

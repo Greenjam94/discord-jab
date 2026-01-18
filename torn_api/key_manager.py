@@ -1,6 +1,5 @@
 """Key manager for Torn API keys with permission tracking."""
 
-import os
 import json
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -44,20 +43,17 @@ class TornKeyManager:
         return f"****-****-****-{key[-4:]}"
     
     def get_key_value(self, key_alias: str) -> Optional[str]:
-        """Get the actual key value from environment variable."""
+        """Get the actual key value from stored JSON data."""
         if key_alias not in self.metadata.get("keys", {}):
             return None
         
-        env_var = self.metadata["keys"][key_alias].get("env_var")
-        if not env_var:
-            return None
-        
-        return os.getenv(env_var)
+        # Return the stored API key directly
+        return self.metadata["keys"][key_alias].get("api_key")
     
     def add_key(
         self,
         key_alias: str,
-        env_var: str,
+        api_key: str,
         owner: str,
         key_type: str = "user"
     ) -> Dict[str, Any]:
@@ -65,14 +61,13 @@ class TornKeyManager:
         if key_alias in self.metadata.get("keys", {}):
             raise ValueError(f"Key alias '{key_alias}' already exists")
         
-        key_value = os.getenv(env_var)
-        if not key_value:
-            raise ValueError(f"Environment variable '{env_var}' not found")
+        if not api_key or not api_key.strip():
+            raise ValueError("API key cannot be empty")
         
-        # Initialize metadata
+        # Initialize metadata with actual API key stored
         self.metadata.setdefault("keys", {})[key_alias] = {
             "owner": owner,
-            "env_var": env_var,
+            "api_key": api_key.strip(),
             "access_level": "Unknown",
             "permissions": [],
             "last_validated": None,

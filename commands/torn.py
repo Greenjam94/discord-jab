@@ -17,13 +17,13 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="torn-key-add", description="Register a new Torn API key (Admin only)")
     @discord.app_commands.describe(
         key_alias="A name/alias for this key",
-        env_var_name="Environment variable name containing the key",
+        api_key="The Torn API key to store",
         owner="Discord user ID (leave empty for personal key, or 'shared' for shared key)"
     )
     async def torn_key_add(
         interaction: discord.Interaction,
         key_alias: str,
-        env_var_name: str,
+        api_key: str,
         owner: Optional[str] = None
     ):
         """Add a new Torn API key to the registry."""
@@ -45,7 +45,7 @@ def setup(bot: commands.Bot):
             key_type = "shared" if owner == "shared" else "user"
             
             # Add key
-            key_manager.add_key(key_alias, env_var_name, owner, key_type)
+            key_manager.add_key(key_alias, api_key, owner, key_type)
             
             # Validate key
             validation = await key_manager.validate_key(key_alias)
@@ -319,17 +319,21 @@ def setup(bot: commands.Bot):
             key_value = key_manager.get_key_value(key_alias)
             if not key_value:
                 await interaction.followup.send(
-                    f"❌ Key '{key_alias}' not found in environment variables.",
+                    f"❌ Key '{key_alias}' not found.",
                     ephemeral=True
                 )
                 return
             
+            # Get masked key for data source tracking
+            masked_key = key_manager.mask_key(key_value) if key_value else None
+            
             # Make API request
             client = TornAPIClient()
             try:
-                data = await client.get_user(key_value, user_id, selections=["basic", "profile"])
+                data = await client.get_user(key_value, user_id, selections=["basic", "profile", "battlestats", "networth"])
                 
-                name = f'{data.get("name", "Unknown")} [{data.get("player_id", "Unknown")}]'
+                player_id = data.get("player_id") or user_id
+                name = data.get("name", "Unknown")
                 level = data.get("level", "Unknown")
                 rank = data.get("rank", "Unknown")
                 current_life = data.get("life", {}).get("current", -1)
@@ -343,8 +347,52 @@ def setup(bot: commands.Bot):
                 status_desc = status.get("description", "Unknown")
                 status_state = status.get("state", "Unknown")
                 
+                # Extract faction ID if available
+                faction_id = data.get("faction", {}).get("faction_id") if isinstance(data.get("faction"), dict) else data.get("faction")
+                
+                # Save to database if available
+                if hasattr(bot, 'database') and bot.database and player_id:
+                    try:
+                        # Upsert player current state
+                        await bot.database.upsert_player(
+                            player_id=player_id,
+                            name=name,
+                            level=level if isinstance(level, int) else None,
+                            rank=rank if isinstance(rank, str) else None,
+                            faction_id=faction_id if isinstance(faction_id, int) else None,
+                            status_state=status_state if isinstance(status_state, str) else None,
+                            status_description=status_desc if isinstance(status_desc, str) else None,
+                            life_current=current_life if current_life >= 0 else None,
+                            life_maximum=max_life if max_life > 0 else None
+                        )
+                        
+                        # Extract stats for history
+                        battlestats = data.get("battlestats", {})
+                        networth_data = data.get("networth", {})
+                        
+                        # Append to history if we have stat data
+                        if battlestats or networth_data or level:
+                            await bot.database.append_player_stats(
+                                player_id=player_id,
+                                strength=battlestats.get("strength"),
+                                defense=battlestats.get("defense"),
+                                speed=battlestats.get("speed"),
+                                dexterity=battlestats.get("dexterity"),
+                                total_stats=battlestats.get("total"),
+                                level=level if isinstance(level, int) else None,
+                                life_maximum=max_life if max_life > 0 else None,
+                                networth=networth_data.get("total") if isinstance(networth_data, dict) else (networth_data if isinstance(networth_data, (int, float)) else None),
+                                data_source=masked_key
+                            )
+                    except Exception as db_error:
+                        # Log detailed error but don't fail the command if database save fails
+                        import traceback
+                        error_details = traceback.format_exc()
+                        print(f"Warning: Failed to save user data to database: {db_error}")
+                        print(f"Error details: {error_details}")
+                
                 embed = discord.Embed(
-                    title=f"User: {name}",
+                    title=f"User: {name} [{player_id}]",
                     color=discord.Color.blue()
                 )
                 embed.add_field(name="Level", value=str(level), inline=True)
@@ -396,10 +444,13 @@ def setup(bot: commands.Bot):
             key_value = key_manager.get_key_value(key_alias)
             if not key_value:
                 await interaction.followup.send(
-                    f"❌ Key '{key_alias}' not found in environment variables.",
+                    f"❌ Key '{key_alias}' not found.",
                     ephemeral=True
                 )
                 return
+            
+            # Get masked key for data source tracking
+            masked_key = key_manager.mask_key(key_value) if key_value else None
             
             # Make API request
             client = TornAPIClient()
@@ -407,15 +458,44 @@ def setup(bot: commands.Bot):
                 data = await client.get_faction(key_value, faction_id, selections=["basic"])
                 
                 # Format response
+                faction_id_display = data.get("ID") or faction_id
                 faction_name = data.get("name", "Unknown")
-                faction_id_display = data.get("ID", faction_id or "?")
                 tag = data.get("tag", "?")
                 respect = data.get("respect", "?")
                 age = data.get("age", "?")
                 best_chain = data.get("best_chain", "?")
-                members_count = len(data.get("members", {}))
+                members = data.get("members", {})
+                members_count = len(members) if isinstance(members, dict) else 0
                 leader = data.get("leader", "?")
                 coleader = data.get("co-leader", "?")
+                
+                # Save to database if available
+                if hasattr(bot, 'database') and bot.database and faction_id_display:
+                    try:
+                        # Upsert faction current state
+                        await bot.database.upsert_faction(
+                            faction_id=faction_id_display,
+                            name=faction_name,
+                            tag=tag if isinstance(tag, str) else None,
+                            leader_id=leader if isinstance(leader, int) else None,
+                            co_leader_id=coleader if isinstance(coleader, int) else None,
+                            respect=respect if isinstance(respect, int) else None,
+                            age=age if isinstance(age, int) else None,
+                            best_chain=best_chain if isinstance(best_chain, int) else None,
+                            member_count=members_count
+                        )
+                        
+                        # Append to history
+                        await bot.database.append_faction_history(
+                            faction_id=faction_id_display,
+                            respect=respect if isinstance(respect, int) else None,
+                            member_count=members_count,
+                            best_chain=best_chain if isinstance(best_chain, int) else None,
+                            data_source=masked_key
+                        )
+                    except Exception as db_error:
+                        # Log but don't fail the command if database save fails
+                        print(f"Warning: Failed to save faction data to database: {db_error}")
                 
                 embed = discord.Embed(
                     title=f"Faction: {faction_name} [{tag}]",

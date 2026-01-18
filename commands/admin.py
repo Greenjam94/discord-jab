@@ -333,3 +333,122 @@ def setup(bot: commands.Bot):
             await msg.edit(content=result["message"])
         except Exception as e:
             await msg.edit(content=f"❌ Failed to sync commands: {str(e)}")
+    
+    @bot.tree.command(name="db-health", description="View database health metrics (Admin only)")
+    async def db_health(interaction: discord.Interaction):
+        """Display database health metrics."""
+        # Check if user has permission
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to view database metrics.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Get database instance from bot
+            if not hasattr(bot, 'database') or bot.database is None:
+                await interaction.followup.send(
+                    "❌ Database not initialized. Please check bot configuration.",
+                    ephemeral=True
+                )
+                return
+            
+            metrics = await bot.database.get_health_metrics()
+            
+            # Build embed
+            embed = discord.Embed(
+                title="📊 Database Health Metrics",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            # Database info
+            embed.add_field(
+                name="Database Info",
+                value=f"**Size:** {metrics.get('database_size_mb', 0)} MB\n"
+                      f"**Schema Version:** {metrics.get('schema_version', 'Unknown')}",
+                inline=False
+            )
+            
+            # Current state tables
+            embed.add_field(
+                name="Current State Tables",
+                value=f"**Players:** {metrics.get('players_count', 0):,}\n"
+                      f"**Factions:** {metrics.get('factions_count', 0):,}",
+                inline=True
+            )
+            
+            # Append-only tables
+            history_counts = (
+                f"**Player Stats:** {metrics.get('player_stats_history_count', 0):,}\n"
+                f"**Faction History:** {metrics.get('faction_history_count', 0):,}\n"
+                f"**War Status:** {metrics.get('war_status_history_count', 0):,}\n"
+                f"**Territory Ownership:** {metrics.get('territory_ownership_history_count', 0):,}"
+            )
+            embed.add_field(
+                name="Historical Records",
+                value=history_counts,
+                inline=True
+            )
+            
+            # Summary tables
+            summary_counts = (
+                f"**Player Stats:** {metrics.get('player_stats_summary_count', 0):,}\n"
+                f"**Faction:** {metrics.get('faction_summary_count', 0):,}\n"
+                f"**Wars:** {metrics.get('war_summary_count', 0):,}\n"
+                f"**Territories:** {metrics.get('territory_ownership_summary_count', 0):,}"
+            )
+            embed.add_field(
+                name="Monthly Summaries",
+                value=summary_counts,
+                inline=True
+            )
+            
+            # Old records (should be pruned)
+            old_records = (
+                f"**Player Stats:** {metrics.get('player_stats_history_old_records', 0):,}\n"
+                f"**Faction History:** {metrics.get('faction_history_old_records', 0):,}\n"
+                f"**War Status:** {metrics.get('war_status_history_old_records', 0):,}\n"
+                f"**Territory:** {metrics.get('territory_ownership_history_old_records', 0):,}"
+            )
+            
+            total_old = (
+                metrics.get('player_stats_history_old_records', 0) +
+                metrics.get('faction_history_old_records', 0) +
+                metrics.get('war_status_history_old_records', 0) +
+                metrics.get('territory_ownership_history_old_records', 0)
+            )
+            
+            if total_old > 0:
+                embed.add_field(
+                    name="⚠️ Records > 2 Months Old",
+                    value=old_records,
+                    inline=False
+                )
+                embed.color = discord.Color.orange()
+            else:
+                embed.add_field(
+                    name="✅ Pruning Status",
+                    value="No records older than 2 months found.",
+                    inline=False
+                )
+            
+            # Data range info
+            if metrics.get('player_stats_history_oldest'):
+                embed.add_field(
+                    name="Data Range",
+                    value=f"**Oldest:** {metrics.get('player_stats_history_oldest', 'N/A')}\n"
+                          f"**Newest:** {metrics.get('player_stats_history_newest', 'N/A')}",
+                    inline=False
+                )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error retrieving database metrics: {str(e)}",
+                ephemeral=True
+            )
