@@ -38,120 +38,6 @@ def setup(bot: commands.Bot):
             ephemeral=True
         )
     
-    @bot.tree.command(name="mute", description="Mute a user in the server")
-    @discord.app_commands.describe(
-        user="The user to mute",
-        duration="Duration (e.g., 10m, 1h, 30s, 2d)",
-        reason="Reason for muting"
-    )
-    async def mute(interaction: discord.Interaction, user: discord.Member, duration: str = "10m", reason: str = "No reason provided"):
-        """Mute command - mutes a user using timeout"""
-        # Check if user has permission
-        if not interaction.user.guild_permissions.moderate_members:
-            await interaction.response.send_message(
-                "You don't have permission to mute members.",
-                ephemeral=True
-            )
-            return
-        
-        # Check if bot has permission
-        if not interaction.guild.me.guild_permissions.moderate_members:
-            await interaction.response.send_message(
-                "I don't have permission to mute members. Please give me the 'Timeout Members' permission.",
-                ephemeral=True
-            )
-            return
-        
-        # Can't mute yourself
-        if user.id == interaction.user.id:
-            await interaction.response.send_message(
-                "You can't mute yourself!",
-                ephemeral=True
-            )
-            return
-        
-        # Can't mute the bot
-        if user.id == bot.user.id:
-            await interaction.response.send_message(
-                "I can't mute myself!",
-                ephemeral=True
-            )
-            return
-        
-        # Check if target user has higher role
-        if interaction.user.top_role <= user.top_role and interaction.user.id != interaction.guild.owner_id:
-            await interaction.response.send_message(
-                "You can't mute someone with equal or higher permissions than you.",
-                ephemeral=True
-            )
-            return
-        
-        try:
-            # Parse duration
-            duration_delta = parse_duration(duration)
-            
-            # Discord timeout limit is 28 days
-            max_duration = timedelta(days=28)
-            if duration_delta > max_duration:
-                await interaction.response.send_message(
-                    "Maximum mute duration is 28 days.",
-                    ephemeral=True
-                )
-                return
-            
-            # Calculate timeout until time
-            timeout_until = datetime.utcnow() + duration_delta
-            
-            # Apply timeout
-            await user.timeout(timeout_until, reason=f"Muted by {interaction.user.display_name}: {reason}")
-            
-            # Format duration for display
-            duration_parts = []
-            total_seconds = int(duration_delta.total_seconds())
-            if total_seconds >= 86400:
-                days = total_seconds // 86400
-                duration_parts.append(f"{days}d")
-                total_seconds %= 86400
-            if total_seconds >= 3600:
-                hours = total_seconds // 3600
-                duration_parts.append(f"{hours}h")
-                total_seconds %= 3600
-            if total_seconds >= 60:
-                minutes = total_seconds // 60
-                duration_parts.append(f"{minutes}m")
-                total_seconds %= 60
-            if total_seconds > 0:
-                duration_parts.append(f"{total_seconds}s")
-            
-            duration_display = " ".join(duration_parts) if duration_parts else "0s"
-            
-            await interaction.response.send_message(
-                f"🔇 Muted {user.mention} for {duration_display}\nReason: {reason}",
-                ephemeral=False
-            )
-            
-            # Try to DM the user
-            try:
-                await user.send(f"You have been muted in {interaction.guild.name} for {duration_display}.\nReason: {reason}")
-            except discord.Forbidden:
-                pass  # User has DMs disabled, that's okay
-            
-        except ValueError as e:
-            await interaction.response.send_message(
-                f"Invalid duration format: {str(e)}\nUse format like: 10m, 1h, 30s, 2d",
-                ephemeral=True
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to mute this user. They may have a higher role than me.",
-                ephemeral=True
-            )
-        except Exception as e:
-            await interaction.response.send_message(
-                f"An error occurred while muting: {str(e)}",
-                ephemeral=True
-            )
-    
     @bot.tree.command(name="warn", description="Warn a user in the server")
     @discord.app_commands.describe(
         user="The user to warn",
@@ -196,12 +82,6 @@ def setup(bot: commands.Bot):
             f"⚠️ {user.mention} has been warned by {interaction.user.mention}\nReason: {reason}",
             ephemeral=False
         )
-        
-        # Try to DM the user
-        try:
-            await user.send(f"You have received a warning in {interaction.guild.name}.\nReason: {reason}")
-        except discord.Forbidden:
-            pass  # User has DMs disabled, that's okay
     
     async def perform_sync_validation(bot: commands.Bot, force_guild_sync: bool = False):
         """Shared function to perform command sync and validation with comprehensive diagnostics"""
@@ -433,7 +313,7 @@ def setup(bot: commands.Bot):
     
     @bot.command(name="sync-commands")
     async def sync_commands_prefix(ctx: commands.Context):
-        """Sync commands prefix command - manually triggers command sync and validation"""
+        """Sync commands via ! prefix - manually triggers command sync and validation"""
         # Check if user has permission (administrator or manage guild)
         if not ctx.guild:
             await ctx.send("❌ This command can only be used in a server.")
