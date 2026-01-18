@@ -329,28 +329,30 @@ def setup(bot: commands.Bot):
             try:
                 data = await client.get_user(key_value, user_id, selections=["basic", "profile"])
                 
-                # Format response
-                if user_id:
-                    user_data = data
-                else:
-                    user_data = data
-                
-                name = user_data.get("name", "Unknown")
-                level = user_data.get("level", "?")
-                status = user_data.get("status", {})
+                name = f'{data.get("name", "Unknown")} [{data.get("player_id", "Unknown")}]'
+                level = data.get("level", "Unknown")
+                rank = data.get("rank", "Unknown")
+                current_life = data.get("life", {}).get("current", -1)
+                max_life = data.get("life", {}).get("maximum", -1)
+                life = (
+                    f"{round((current_life / max_life) * 100)}%"
+                    if current_life >= 0 and max_life > 0
+                    else "N/A"
+                )
+                status = data.get("status", {})
                 status_desc = status.get("description", "Unknown")
                 status_state = status.get("state", "Unknown")
                 
                 embed = discord.Embed(
-                    title=f"Torn User: {name}",
+                    title=f"User: {name}",
                     color=discord.Color.blue()
                 )
                 embed.add_field(name="Level", value=str(level), inline=True)
+                embed.add_field(name="Rank", value=rank, inline=True)
                 embed.add_field(name="Status", value=status_state, inline=True)
-                embed.add_field(name="Description", value=status_desc[:100] or "None", inline=False)
-                
-                if user_id:
-                    embed.add_field(name="User ID", value=str(user_id), inline=True)
+                embed.add_field(name="Life", value=life, inline=True)
+                if status_desc != status_state:
+                    embed.add_field(name="Description", value=status_desc[:100] or "None", inline=False)
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
@@ -407,18 +409,34 @@ def setup(bot: commands.Bot):
                 # Format response
                 faction_name = data.get("name", "Unknown")
                 faction_id_display = data.get("ID", faction_id or "?")
+                tag = data.get("tag", "?")
                 respect = data.get("respect", "?")
                 age = data.get("age", "?")
                 best_chain = data.get("best_chain", "?")
+                members_count = len(data.get("members", {}))
+                leader = data.get("leader", "?")
+                coleader = data.get("co-leader", "?")
                 
                 embed = discord.Embed(
-                    title=f"Faction: {faction_name}",
+                    title=f"Faction: {faction_name} [{tag}]",
                     color=discord.Color.green()
                 )
                 embed.add_field(name="Faction ID", value=str(faction_id_display), inline=True)
+                embed.add_field(
+                    name="Leader",
+                    value=f"[View Profile](https://www.torn.com/profiles.php?XID={leader})",
+                    inline=True
+                )
+
+                embed.add_field(
+                    name="Co-Leader",
+                    value=f"[View Profile](https://www.torn.com/profiles.php?XID={coleader})",
+                    inline=True
+                )
                 embed.add_field(name="Respect", value=str(respect), inline=True)
                 embed.add_field(name="Age", value=f"{age} days", inline=True)
                 embed.add_field(name="Best Chain", value=str(best_chain), inline=True)
+                embed.add_field(name="Members", value=str(members_count), inline=True)
                 
                 await interaction.followup.send(embed=embed, ephemeral=True)
                 
