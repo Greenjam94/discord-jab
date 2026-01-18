@@ -72,5 +72,7 @@ def setup(bot: commands.Bot):
     
     @bot.tree.command(name="parrot", description="Repeat anything you say")
     async def parrot(interaction: discord.Interaction, text: str):
-        """Parrot command - repeats the provided text"""
+        """Parrot command - repeats the provided text or squaks"""
+        if random.randint(1, 1000) % 3 == 0:
+            text = 'Squak!'
         await interaction.response.send_message(text)
