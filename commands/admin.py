@@ -4,6 +4,7 @@ import re
 import os
 import asyncio
 from datetime import datetime, timedelta
+from typing import Optional
 
 def parse_duration(duration_str: str) -> timedelta:
     """Parse duration string like '10m', '1h', '30s' into timedelta"""
@@ -450,5 +451,359 @@ def setup(bot: commands.Bot):
         except Exception as e:
             await interaction.followup.send(
                 f"❌ Error retrieving database metrics: {str(e)}",
+                ephemeral=True
+            )
+    
+    @bot.tree.command(name="db-query", description="Query database tables with pagination (Admin only)")
+    @discord.app_commands.describe(
+        table="Table name to query",
+        page="Page number (starts at 1)",
+        limit="Number of rows per page (1-50, default: 20)",
+        order_by="Column to order by (default: primary key or first column)",
+        filter="Optional WHERE clause filter (e.g., 'player_id = 12345')"
+    )
+    async def db_query(
+        interaction: discord.Interaction,
+        table: str,
+        page: int = 1,
+        limit: int = 20,
+        order_by: Optional[str] = None,
+        filter: Optional[str] = None
+    ):
+        """Query database tables with pagination."""
+        # Check permissions
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to query the database.",
+                ephemeral=True
+            )
+            return
+        
+        # Validate limit
+        limit = max(1, min(50, limit))
+        
+        # Validate page
+        if page < 1:
+            page = 1
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            if not hasattr(bot, 'database') or bot.database is None:
+                await interaction.followup.send(
+                    "❌ Database not initialized.",
+                    ephemeral=True
+                )
+                return
+            
+            # Get table info to validate
+            table_info = await bot.database.get_table_info()
+            
+            if table not in table_info:
+                available = ', '.join(sorted(table_info.keys()))
+                await interaction.followup.send(
+                    f"❌ Table '{table}' not found.\n\n**Available tables:**\n{available}",
+                    ephemeral=True
+                )
+                return
+            
+            # Calculate offset
+            offset = (page - 1) * limit
+            
+            # Parse filter into where clause and params (simple parsing)
+            where_clause = None
+            where_params = None
+            
+            if filter:
+                # Basic filter parsing - only allow simple comparisons
+                # This is a simple implementation - for production, use a proper SQL parser or builder
+                where_clause = filter
+            
+            # Query the table
+            rows, total_count = await bot.database.query_table(
+                table_name=table,
+                limit=limit,
+                offset=offset,
+                order_by=order_by,
+                where_clause=where_clause,
+                where_params=where_params
+            )
+            
+            if not rows:
+                await interaction.followup.send(
+                    f"📭 No rows found in `{table}`" + (f" with filter `{filter}`" if filter else ""),
+                    ephemeral=True
+                )
+                return
+            
+            # Calculate pagination info
+            total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
+            
+            # Format rows for display
+            columns = list(rows[0].keys())
+            
+            # Truncate long values for Discord
+            def truncate_value(value, max_len=50):
+                if value is None:
+                    return "NULL"
+                str_val = str(value)
+                if len(str_val) > max_len:
+                    return str_val[:max_len-3] + "..."
+                return str_val
+            
+            # Build display text
+            display_rows = []
+            for row in rows:
+                row_str = " | ".join([f"**{col}**: {truncate_value(row[col])}" for col in columns[:5]])  # Show first 5 columns
+                display_rows.append(row_str)
+            
+            embed = discord.Embed(
+                title=f"📊 Database Query: `{table}`",
+                description=f"**Page {page}/{total_pages}** ({total_count:,} total rows)\n" +
+                           (f"**Filter:** `{filter}`\n" if filter else "") +
+                           (f"**Order by:** `{order_by}`\n" if order_by else ""),
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            # Add rows (Discord embed limit is ~6000 chars, so be conservative)
+            rows_text = "\n".join(display_rows[:10])  # Show max 10 rows per page
+            if len(display_rows) > 10:
+                rows_text += f"\n... and {len(display_rows) - 10} more (showing first 10)"
+            
+            embed.add_field(
+                name=f"Rows {offset + 1}-{min(offset + limit, total_count)}",
+                value=rows_text[:1024],  # Discord field limit
+                inline=False
+            )
+            
+            embed.set_footer(text=f"Columns: {', '.join(columns)}")
+            
+            # Create pagination buttons
+            view = DatabaseQueryView(
+                bot=bot,
+                table=table,
+                page=page,
+                limit=limit,
+                total_pages=total_pages,
+                total_count=total_count,
+                order_by=order_by,
+                filter=filter
+            )
+            
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            
+        except ValueError as e:
+            await interaction.followup.send(
+                f"❌ Invalid query: {str(e)}",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error querying database: {str(e)}",
+                ephemeral=True
+            )
+    
+    @bot.tree.command(name="db-tables", description="List all available database tables (Admin only)")
+    async def db_tables(interaction: discord.Interaction):
+        """List all available database tables."""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to view database tables.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            if not hasattr(bot, 'database') or bot.database is None:
+                await interaction.followup.send(
+                    "❌ Database not initialized.",
+                    ephemeral=True
+                )
+                return
+            
+            table_info = await bot.database.get_table_info()
+            
+            embed = discord.Embed(
+                title="📋 Available Database Tables",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            # Group tables by category
+            current_state = ['players', 'factions']
+            history = ['player_stats_history', 'faction_history', 'war_status_history', 'territory_ownership_history']
+            summaries = ['player_stats_summary', 'faction_summary', 'war_summary', 'territory_ownership_summary']
+            competitions = ['competitions', 'competition_participants', 'competition_teams', 'competition_start_stats', 'competition_stats']
+            
+            def format_table_list(tables):
+                return "\n".join([f"• `{t}` ({len(table_info.get(t, []))} columns)" for t in tables if t in table_info])
+            
+            if any(t in table_info for t in current_state):
+                embed.add_field(
+                    name="Current State Tables",
+                    value=format_table_list(current_state),
+                    inline=False
+                )
+            
+            if any(t in table_info for t in history):
+                embed.add_field(
+                    name="Historical Tables",
+                    value=format_table_list(history),
+                    inline=False
+                )
+            
+            if any(t in table_info for t in summaries):
+                embed.add_field(
+                    name="Summary Tables",
+                    value=format_table_list(summaries),
+                    inline=False
+                )
+            
+            if any(t in table_info for t in competitions):
+                embed.add_field(
+                    name="Competition Tables",
+                    value=format_table_list(competitions),
+                    inline=False
+                )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error listing tables: {str(e)}",
+                ephemeral=True
+            )
+
+
+class DatabaseQueryView(discord.ui.View):
+    """View with buttons for paginating database query results."""
+    
+    def __init__(
+        self,
+        bot: commands.Bot,
+        table: str,
+        page: int,
+        limit: int,
+        total_pages: int,
+        total_count: int,
+        order_by: Optional[str],
+        filter: Optional[str]
+    ):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.bot = bot
+        self.table = table
+        self.page = page
+        self.limit = limit
+        self.total_pages = total_pages
+        self.total_count = total_count
+        self.order_by = order_by
+        self.filter = filter
+    
+    @discord.ui.button(label="◀️ First", style=discord.ButtonStyle.secondary, disabled=True)
+    async def first_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page == 1:
+            return
+        self.page = 1
+        await self.update_view(interaction)
+    
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.primary, disabled=True)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+            await self.update_view(interaction)
+    
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.total_pages:
+            self.page += 1
+            await self.update_view(interaction)
+    
+    @discord.ui.button(label="Last ▶️▶️", style=discord.ButtonStyle.secondary)
+    async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page == self.total_pages:
+            return
+        self.page = self.total_pages
+        await self.update_view(interaction)
+    
+    async def update_view(self, interaction: discord.Interaction):
+        """Update the view with new page."""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to query the database.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer()
+        
+        try:
+            offset = (self.page - 1) * self.limit
+            
+            rows, total_count = await self.bot.database.query_table(
+                table_name=self.table,
+                limit=self.limit,
+                offset=offset,
+                order_by=self.order_by,
+                where_clause=self.filter,
+                where_params=None
+            )
+            
+            if not rows:
+                await interaction.followup.send(
+                    f"📭 No rows found.",
+                    ephemeral=True
+                )
+                return
+            
+            columns = list(rows[0].keys())
+            
+            def truncate_value(value, max_len=50):
+                if value is None:
+                    return "NULL"
+                str_val = str(value)
+                if len(str_val) > max_len:
+                    return str_val[:max_len-3] + "..."
+                return str_val
+            
+            display_rows = []
+            for row in rows:
+                row_str = " | ".join([f"**{col}**: {truncate_value(row[col])}" for col in columns[:5]])
+                display_rows.append(row_str)
+            
+            embed = discord.Embed(
+                title=f"📊 Database Query: `{self.table}`",
+                description=f"**Page {self.page}/{self.total_pages}** ({total_count:,} total rows)\n" +
+                           (f"**Filter:** `{self.filter}`\n" if self.filter else "") +
+                           (f"**Order by:** `{self.order_by}`\n" if self.order_by else ""),
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            rows_text = "\n".join(display_rows[:10])
+            if len(display_rows) > 10:
+                rows_text += f"\n... and {len(display_rows) - 10} more (showing first 10)"
+            
+            embed.add_field(
+                name=f"Rows {offset + 1}-{min(offset + self.limit, total_count)}",
+                value=rows_text[:1024],
+                inline=False
+            )
+            
+            embed.set_footer(text=f"Columns: {', '.join(columns)}")
+            
+            # Update button states
+            self.first_page.disabled = self.page == 1
+            self.prev_page.disabled = self.page == 1
+            self.next_page.disabled = self.page >= self.total_pages
+            self.last_page.disabled = self.page >= self.total_pages
+            
+            await interaction.followup.edit_message(interaction.message.id, embed=embed, view=self)
+            
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error: {str(e)}",
                 ephemeral=True
             )

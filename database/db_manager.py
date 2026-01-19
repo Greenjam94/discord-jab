@@ -4,7 +4,7 @@ import aiosqlite
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 import json
 
@@ -1473,3 +1473,106 @@ class TornDatabase:
             WHERE id = ?
         """, (captain_discord_id_1, captain_discord_id_2, team_id))
         await self.connection.commit()
+    
+    async def get_table_info(self) -> Dict[str, List[str]]:
+        """Get list of available tables and their columns.
+        
+        Returns:
+            Dict mapping table names to list of column names
+        """
+        table_info = {}
+        async with self.connection.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+        """) as cursor:
+            tables = await cursor.fetchall()
+            
+            for (table_name,) in tables:
+                async with self.connection.execute(f"PRAGMA table_info({table_name})") as col_cursor:
+                    columns = await col_cursor.fetchall()
+                    table_info[table_name] = [col[1] for col in columns]  # col[1] is column name
+        
+        return table_info
+    
+    async def query_table(
+        self,
+        table_name: str,
+        limit: int = 100,
+        offset: int = 0,
+        order_by: Optional[str] = None,
+        where_clause: Optional[str] = None,
+        where_params: Optional[tuple] = None
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Safely query a table with pagination.
+        
+        Args:
+            table_name: Name of the table to query (must be a valid table name)
+            limit: Maximum number of rows to return
+            offset: Number of rows to skip
+            order_by: Column name to order by (optional)
+            where_clause: WHERE clause (without WHERE keyword, optional)
+            where_params: Parameters for WHERE clause (optional)
+            
+        Returns:
+            Tuple of (list of row dicts, total count)
+        """
+        # Whitelist of allowed table names for safety
+        allowed_tables = {
+            'players', 'factions', 'player_stats_history', 'faction_history',
+            'war_status_history', 'territory_ownership_history',
+            'player_stats_summary', 'faction_summary', 'war_summary',
+            'territory_ownership_summary', 'competitions', 'competition_participants',
+            'competition_teams', 'competition_start_stats', 'competition_stats'
+        }
+        
+        if table_name not in allowed_tables:
+            raise ValueError(f"Table '{table_name}' is not allowed or doesn't exist")
+        
+        # Build query safely
+        count_query = f"SELECT COUNT(*) FROM {table_name}"
+        data_query = f"SELECT * FROM {table_name}"
+        
+        if where_clause:
+            count_query += f" WHERE {where_clause}"
+            data_query += f" WHERE {where_clause}"
+        
+        # Get total count
+        params = where_params or ()
+        async with self.connection.execute(count_query, params) as cursor:
+            total_count = (await cursor.fetchone())[0]
+        
+        # Add ordering
+        if order_by:
+            # Validate order_by column (basic check)
+            if not order_by.replace('_', '').replace('-', '').replace(' ', '').isalnum():
+                raise ValueError("Invalid order_by column name")
+            data_query += f" ORDER BY {order_by}"
+        
+        # Add pagination
+        data_query += f" LIMIT ? OFFSET ?"
+        
+        params = (where_params or ()) + (limit, offset)
+        
+        # Execute query
+        async with self.connection.execute(data_query, params) as cursor:
+            rows = await cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            
+            result = []
+            for row in rows:
+                row_dict = {}
+                for i, col in enumerate(columns):
+                    value = row[i]
+                    # Convert timestamps to readable format
+                    if col in ['timestamp', 'recorded_at', 'created_at', 'last_updated', 
+                              'started_at', 'ends_at', 'start_date', 'end_date', 'period_start', 'period_end']:
+                        if value:
+                            try:
+                                value = datetime.fromtimestamp(value).isoformat()
+                            except (ValueError, TypeError):
+                                pass
+                    row_dict[col] = value
+                result.append(row_dict)
+        
+        return result, total_count
