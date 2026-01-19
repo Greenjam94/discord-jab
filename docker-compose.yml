@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jab-discord-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}
+      - DATABASE_PATH=/app/data/torn_data.db
+      - WEB_PORT=${WEB_PORT:-5000}
+      - FLASK_DEBUG=${FLASK_DEBUG:-False}
+    volumes:
+      - jab-discord-data:/app/data
+      - jab-discord-data-api:/app/data/api_inventory
+    networks:
+      - jab-discord-network
+    command: python bot.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  webapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jab-discord-webapp
+    restart: unless-stopped
+    environment:
+      - DATABASE_PATH=/app/data/torn_data.db
+      - WEB_PORT=${WEB_PORT:-5000}
+      - FLASK_DEBUG=${FLASK_DEBUG:-False}
+      - FLASK_ENV=production
+    volumes:
+      - jab-discord-data:/app/data
+      - jab-discord-data-api:/app/data/api_inventory
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    networks:
+      - jab-discord-network
+    command: python web_app.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/tables')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  jab-discord-data:
+    driver: local
+  jab-discord-data-api:
+    driver: local
+
+networks:
+  jab-discord-network:
+    driver: bridge

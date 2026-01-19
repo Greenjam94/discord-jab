@@ -11,3 +11,10 @@ venv/
 README.md
 .env
 *.md
+# Exclude database files from image (they'll be in volumes)
+data/torn_data.db
+data/torn_data.db-shm
+data/torn_data.db-wal
+data/torn_keys.json
+# But keep the api_inventory JSON files (they're part of the codebase)
+!data/api_inventory/
