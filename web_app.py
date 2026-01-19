@@ -1,12 +1,13 @@
 """Simple Flask web interface for database browsing."""
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 import aiosqlite
 import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 import os
+import sys
 
 app = Flask(__name__)
 
@@ -625,7 +626,19 @@ def query_table_sync(
 @app.route('/')
 def index():
     """Main page."""
-    return render_template_string(HTML_TEMPLATE)
+    # Inject navigation into the template
+    nav_html = """
+    <div style="margin-bottom: 20px;">
+        <a href="/instances" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">🤖 Bot Instances</a>
+        <a href="/" style="color: #4ec9b0; text-decoration: none; font-weight: 600;">🗄️ Database Browser</a>
+    </div>
+    """
+    # Insert navigation after the subtitle
+    template_with_nav = HTML_TEMPLATE.replace(
+        '<p class="subtitle">Browse Torn API data stored in SQLite database</p>',
+        '<p class="subtitle">Browse Torn API data stored in SQLite database</p>' + nav_html
+    )
+    return render_template_string(template_with_nav)
 
 
 @app.route('/api/tables')
@@ -679,6 +692,914 @@ def api_query():
         })
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# Global bot reference (set when bot is running)
+_bot_instance = None
+
+
+def set_bot_instance(bot):
+    """Set the Discord bot instance for status checks."""
+    global _bot_instance
+    _bot_instance = bot
+
+
+def get_all_commands() -> List[str]:
+    """Get list of all bot commands."""
+    commands = [
+        # Admin commands
+        "ping", "warn", "sync-commands", "db-health", "db-query", "db-tables",
+        # Competition commands
+        "competition-list", "competition-create", "competition-cancel", 
+        "competition-status", "competition-team-status", "competition-faction-overview",
+        "competition-team-set-captains", "competition-add-participants",
+        "competition-update-assignment", "competition-update-stats",
+        # Torn commands
+        "torn-key-add", "torn-key-remove", "torn-key-list", "torn-key-check",
+        "torn-key-validate", "torn-user", "torn-faction",
+        # Games commands
+        "diceroll", "parrot"
+    ]
+    return sorted(commands)
+
+
+def get_bot_status(guild_id: str) -> Dict[str, Any]:
+    """Get bot status for a guild.
+    
+    First tries to use the direct bot instance if available.
+    Falls back to checking the database for heartbeat information.
+    """
+    # Try direct bot instance first (if web app and bot are in same process)
+    if _bot_instance:
+        try:
+            if not _bot_instance.is_ready():
+                return {'status': 'unknown', 'bot_running': True, 'bot_online': False, 'message': 'Bot is not ready yet'}
+            
+            guild = _bot_instance.get_guild(int(guild_id))
+            if not guild:
+                return {'status': 'not_in_guild', 'bot_running': True, 'bot_online': True, 'message': 'Bot is not in this guild'}
+            
+            bot_member = guild.get_member(_bot_instance.user.id)
+            if not bot_member:
+                return {'status': 'not_member', 'bot_running': True, 'bot_online': True, 'message': 'Bot member not found in guild'}
+            
+            return {
+                'status': 'active',
+                'bot_running': True,
+                'bot_online': True,
+                'guild_name': guild.name,
+                'member_count': guild.member_count
+            }
+        except (ValueError, AttributeError) as e:
+            # Fall through to database check
+            pass
+        except Exception as e:
+            # Fall through to database check
+            pass
+    
+    # Fallback: Check database for heartbeat (for separate processes)
+    try:
+        import time
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from database import TornDatabase
+            db = TornDatabase(DB_PATH)
+            loop.run_until_complete(db.connect())
+            try:
+                instances = loop.run_until_complete(db.get_bot_instances())
+                instance = next((i for i in instances if i['guild_id'] == guild_id), None)
+                
+                if instance:
+                    last_seen = instance.get('last_seen', 0)
+                    current_time = int(time.time())
+                    time_since_last_seen = current_time - last_seen
+                    
+                    # If last_seen is within last 5 minutes, consider bot online
+                    bot_online = time_since_last_seen < 300 if last_seen else False
+                    
+                    return {
+                        'status': instance.get('status', 'unknown'),
+                        'bot_running': bot_online,
+                        'bot_online': bot_online,
+                        'guild_name': instance.get('guild_name'),
+                        'member_count': instance.get('member_count'),
+                        'message': f'Last seen {time_since_last_seen // 60} minutes ago' if last_seen else 'Never seen'
+                    }
+            finally:
+                loop.run_until_complete(db.close())
+        finally:
+            loop.close()
+    except Exception as e:
+        pass
+    
+    # Final fallback
+    return {'status': 'unknown', 'bot_running': False, 'message': 'Bot status unknown - check if bot is running'}
+
+
+async def get_instances_with_status_async() -> List[Dict[str, Any]]:
+    """Get all bot instances with their current status."""
+    from database import TornDatabase
+    import time
+    
+    db = TornDatabase(DB_PATH)
+    await db.connect()
+    try:
+        instances = await db.get_bot_instances()
+        
+        # Add real-time status for each instance
+        for instance in instances:
+            # Check database heartbeat first
+            last_seen = instance.get('last_seen', 0)
+            current_time = int(time.time())
+            time_since_last_seen = current_time - last_seen if last_seen else 999999
+            
+            # If last_seen is within last 5 minutes, consider bot online
+            bot_online_db = time_since_last_seen < 300 if last_seen else False
+            
+            # Try to get direct status (if bot is in same process)
+            status_info = get_bot_status(instance['guild_id'])
+            
+            # Prefer direct bot status if available, otherwise use database heartbeat
+            if status_info.get('bot_online') is not None and _bot_instance:
+                instance['bot_status'] = status_info['status']
+                instance['bot_running'] = status_info.get('bot_running', False)
+                instance['bot_online'] = status_info.get('bot_online', False)
+            else:
+                # Use database heartbeat
+                instance['bot_status'] = 'active' if bot_online_db else 'inactive'
+                instance['bot_running'] = bot_online_db
+                instance['bot_online'] = bot_online_db
+            
+            # Update with real-time data if available
+            if status_info.get('guild_name'):
+                instance['guild_name'] = status_info['guild_name']
+            if status_info.get('member_count'):
+                instance['member_count'] = status_info['member_count']
+        
+        return instances
+    finally:
+        await db.close()
+
+
+def get_instances_with_status_sync() -> List[Dict[str, Any]]:
+    """Get all bot instances with their current status (sync wrapper)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(get_instances_with_status_async())
+    finally:
+        loop.close()
+
+
+@app.route('/instances')
+def instances():
+    """List all bot instances."""
+    instances_list = get_instances_with_status_sync()
+    commands_list = get_all_commands()
+    
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Bot Instances - Discord Bot Management</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            
+            h1 {
+                color: #4ec9b0;
+                margin-bottom: 10px;
+            }
+            
+            .subtitle {
+                color: #858585;
+                margin-bottom: 30px;
+            }
+            
+            .nav-links {
+                margin-bottom: 20px;
+            }
+            
+            .nav-links a {
+                color: #4ec9b0;
+                text-decoration: none;
+                margin-right: 20px;
+            }
+            
+            .nav-links a:hover {
+                text-decoration: underline;
+            }
+            
+            .instance-card {
+                background: #252526;
+                border: 1px solid #3e3e42;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+                transition: border-color 0.2s;
+            }
+            
+            .instance-card:hover {
+                border-color: #007acc;
+            }
+            
+            .instance-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: start;
+                margin-bottom: 15px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            
+            .instance-title {
+                font-size: 1.3em;
+                font-weight: 600;
+                color: #4ec9b0;
+            }
+            
+            .status-badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 0.85em;
+                font-weight: 600;
+                text-transform: uppercase;
+            }
+            
+            .status-active { background: #1e3a1e; color: #4ec9b0; }
+            .status-inactive { background: #3a1e1e; color: #f48771; }
+            .status-unknown { background: #2d2d30; color: #858585; }
+            .status-not_in_guild { background: #3a3a1e; color: #dcdcaa; }
+            
+            .instance-info {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 15px;
+            }
+            
+            .info-item {
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .info-label {
+                font-size: 0.85em;
+                color: #858585;
+                margin-bottom: 4px;
+            }
+            
+            .info-value {
+                color: #d4d4d4;
+                font-weight: 500;
+            }
+            
+            .instance-actions {
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            
+            .btn {
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                text-decoration: none;
+                display: inline-block;
+                transition: background 0.2s;
+            }
+            
+            .btn-primary {
+                background: #007acc;
+                color: white;
+            }
+            
+            .btn-primary:hover {
+                background: #005a9e;
+            }
+            
+            .btn-secondary {
+                background: #3e3e42;
+                color: #d4d4d4;
+            }
+            
+            .btn-secondary:hover {
+                background: #505050;
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: #858585;
+            }
+            
+            .empty-state h2 {
+                color: #d4d4d4;
+                margin-bottom: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 Bot Instances</h1>
+            <p class="subtitle">Manage Discord bot instances and their command permissions</p>
+            
+            <div class="nav-links">
+                <a href="/">Database Browser</a>
+                <a href="/instances">Instances</a>
+            </div>
+    """
+    
+    if not instances_list:
+        html += """
+            <div class="empty-state">
+                <h2>No Bot Instances Found</h2>
+                <p>No bot instances have been registered yet. Instances are automatically created when the bot joins a server.</p>
+            </div>
+        """
+    else:
+        for instance in instances_list:
+            status = instance.get('bot_status', instance.get('status', 'unknown'))
+            guild_name = instance.get('guild_name', 'Unknown Server')
+            guild_id = instance['guild_id']
+            
+            status_class = {
+                'active': 'status-active',
+                'inactive': 'status-inactive',
+                'not_in_guild': 'status-not_in_guild',
+                'unknown': 'status-unknown'
+            }.get(status, 'status-unknown')
+            
+            member_count = instance.get('member_count', 'N/A')
+            last_seen = instance.get('last_seen')
+            if last_seen:
+                last_seen_str = datetime.fromtimestamp(last_seen).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                last_seen_str = 'Never'
+            
+            html += f"""
+            <div class="instance-card">
+                <div class="instance-header">
+                    <div>
+                        <div class="instance-title">{guild_name}</div>
+                        <div style="color: #858585; font-size: 0.9em; margin-top: 4px;">Guild ID: {guild_id}</div>
+                    </div>
+                    <span class="status-badge {status_class}">{status.replace('_', ' ')}</span>
+                </div>
+                
+                <div class="instance-info">
+                    <div class="info-item">
+                        <span class="info-label">Status</span>
+                        <span class="info-value">{status.replace('_', ' ').title()}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Members</span>
+                        <span class="info-value">{member_count}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Last Seen</span>
+                        <span class="info-value">{last_seen_str}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Bot Running</span>
+                        <span class="info-value">{'✅ Yes' if instance.get('bot_running') else '❌ No'}</span>
+                    </div>
+                </div>
+                
+                <div class="instance-actions">
+                    <a href="/instances/{guild_id}/permissions" class="btn btn-primary">Manage Permissions</a>
+                </div>
+            </div>
+            """
+    
+    html += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html)
+
+
+@app.route('/instances/<guild_id>/permissions')
+def instance_permissions(guild_id):
+    """Manage command permissions for a specific instance."""
+    # Get instance info
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        from database import TornDatabase
+        db = TornDatabase(DB_PATH)
+        loop.run_until_complete(db.connect())
+        
+        try:
+            instances = loop.run_until_complete(db.get_bot_instances())
+            instance = next((i for i in instances if i['guild_id'] == guild_id), None)
+            
+            if not instance:
+                # Create instance if it doesn't exist
+                status_info = get_bot_status(guild_id)
+                guild_name = status_info.get('guild_name', 'Unknown Server')
+                member_count = status_info.get('member_count')
+                status = 'active' if status_info.get('status') == 'active' else 'unknown'
+                
+                loop.run_until_complete(db.upsert_bot_instance(
+                    guild_id, guild_name, status, member_count
+                ))
+                instance = {'guild_id': guild_id, 'guild_name': guild_name, 'status': status}
+            
+            # Get current permissions
+            permissions = loop.run_until_complete(db.get_command_permissions(guild_id))
+            
+            commands_list = get_all_commands()
+            
+        finally:
+            loop.run_until_complete(db.close())
+    finally:
+        loop.close()
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Permissions - {instance.get('guild_name', guild_id)}</title>
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }}
+            
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+            }}
+            
+            h1 {{
+                color: #4ec9b0;
+                margin-bottom: 10px;
+            }}
+            
+            .subtitle {{
+                color: #858585;
+                margin-bottom: 30px;
+            }}
+            
+            .nav-links {{
+                margin-bottom: 20px;
+            }}
+            
+            .nav-links a {{
+                color: #4ec9b0;
+                text-decoration: none;
+                margin-right: 20px;
+            }}
+            
+            .nav-links a:hover {{
+                text-decoration: underline;
+            }}
+            
+            .command-section {{
+                background: #252526;
+                border: 1px solid #3e3e42;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+            }}
+            
+            .command-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 15px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }}
+            
+            .command-name {{
+                font-size: 1.2em;
+                font-weight: 600;
+                color: #4ec9b0;
+                font-family: 'Courier New', monospace;
+            }}
+            
+            .permissions-list {{
+                margin-bottom: 15px;
+            }}
+            
+            .permission-item {{
+                background: #2d2d30;
+                padding: 10px 15px;
+                border-radius: 4px;
+                margin-bottom: 8px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }}
+            
+            .permission-badge {{
+                display: inline-block;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 0.85em;
+                font-weight: 600;
+                margin-right: 10px;
+            }}
+            
+            .badge-admin {{ background: #1e3a1e; color: #4ec9b0; }}
+            .badge-role {{ background: #3a3a1e; color: #dcdcaa; }}
+            .badge-user {{ background: #3a1e3a; color: #ce9178; }}
+            
+            .permission-value {{
+                flex: 1;
+                color: #d4d4d4;
+            }}
+            
+            .add-permission-form {{
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                align-items: flex-end;
+                padding: 15px;
+                background: #2d2d30;
+                border-radius: 4px;
+            }}
+            
+            .form-group {{
+                flex: 1;
+                min-width: 150px;
+            }}
+            
+            label {{
+                display: block;
+                color: #cccccc;
+                margin-bottom: 5px;
+                font-size: 14px;
+            }}
+            
+            select, input {{
+                width: 100%;
+                padding: 8px 12px;
+                background: #1e1e1e;
+                border: 1px solid #3e3e42;
+                border-radius: 4px;
+                color: #d4d4d4;
+                font-size: 14px;
+            }}
+            
+            select:focus, input:focus {{
+                outline: none;
+                border-color: #007acc;
+            }}
+            
+            .btn {{
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                transition: background 0.2s;
+            }}
+            
+            .btn-primary {{
+                background: #007acc;
+                color: white;
+            }}
+            
+            .btn-primary:hover {{
+                background: #005a9e;
+            }}
+            
+            .btn-danger {{
+                background: #be1100;
+                color: white;
+            }}
+            
+            .btn-danger:hover {{
+                background: #8b0d00;
+            }}
+            
+            .btn-small {{
+                padding: 4px 8px;
+                font-size: 12px;
+            }}
+            
+            .empty-permissions {{
+                color: #858585;
+                font-style: italic;
+                padding: 15px;
+                text-align: center;
+            }}
+            
+            .note {{
+                background: #2d2d30;
+                border-left: 3px solid #007acc;
+                padding: 12px;
+                margin-bottom: 20px;
+                border-radius: 4px;
+                font-size: 0.9em;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔐 Command Permissions</h1>
+            <p class="subtitle">Guild: {instance.get('guild_name', guild_id)} (ID: {guild_id})</p>
+            
+            <div class="nav-links">
+                <a href="/instances">← Back to Instances</a>
+            </div>
+            
+            <div class="note">
+                <strong>Note:</strong> Permissions are checked in order: Admin users → Roles → Specific users. 
+                If a user has the "Admin" permission type, they can use the command. Roles and users are checked next.
+                <br><br>
+                <strong>Admin:</strong> No value needed - any server administrator can use the command.
+                <br>
+                <strong>Role:</strong> Requires a Role ID (right-click role → Copy ID).
+                <br>
+                <strong>User:</strong> Requires a Discord User ID.
+            </div>
+    """
+    
+    for command_name in commands_list:
+        command_perms = permissions.get(command_name, [])
+        
+        html += f"""
+            <div class="command-section" data-command="{command_name}">
+                <div class="command-header">
+                    <span class="command-name">/{command_name}</span>
+                </div>
+                
+                <div class="permissions-list">
+        """
+        
+        if command_perms:
+            for perm in command_perms:
+                perm_type = perm['type']
+                perm_value = perm['value']
+                display_value = "Any server admin" if perm_type == 'admin' else perm_value
+                html += f"""
+                    <div class="permission-item">
+                        <div>
+                            <span class="permission-badge badge-{perm_type}">{perm_type.title()}</span>
+                            <span class="permission-value">{display_value}</span>
+                        </div>
+                        <button class="btn btn-danger btn-small" onclick="removePermission('{command_name}', '{perm_type}', '{perm_value}')">Remove</button>
+                    </div>
+                """
+        else:
+            html += '<div class="empty-permissions">No permissions set (command is publicly accessible)</div>'
+        
+        html += f"""
+                </div>
+                
+                <form class="add-permission-form" onsubmit="addPermission(event, '{command_name}')">
+                    <div class="form-group">
+                        <label for="perm_type_{command_name}">Permission Type:</label>
+                        <select id="perm_type_{command_name}" name="permission_type" required onchange="updatePermissionValueField('{command_name}')">
+                            <option value="admin">Admin (any server admin)</option>
+                            <option value="role">Role (role ID)</option>
+                            <option value="user">User (user ID)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="perm_value_{command_name}" id="perm_value_label_{command_name}">Value:</label>
+                        <input type="text" id="perm_value_{command_name}" name="permission_value" 
+                               placeholder="Role ID or User ID">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Permission</button>
+                </form>
+            </div>
+        """
+    
+    html += f"""
+        </div>
+        
+        <script>
+            // Initialize form fields on page load
+            document.addEventListener('DOMContentLoaded', function() {{
+                const commandSections = document.querySelectorAll('[data-command]');
+                commandSections.forEach(section => {{
+                    const commandName = section.getAttribute('data-command');
+                    updatePermissionValueField(commandName);
+                }});
+            }});
+            
+            function updatePermissionValueField(commandName) {{
+                const select = document.getElementById(`perm_type_${{commandName}}`);
+                const input = document.getElementById(`perm_value_${{commandName}}`);
+                const label = document.getElementById(`perm_value_label_${{commandName}}`);
+                
+                if (!select || !input || !label) return;
+                
+                const permType = select.value;
+                
+                if (permType === 'admin') {{
+                    input.required = false;
+                    input.placeholder = 'Not required for admin';
+                    input.value = '';
+                    label.textContent = 'Value: (not required)';
+                }} else if (permType === 'role') {{
+                    input.required = true;
+                    input.placeholder = 'Role ID (right-click role → Copy ID)';
+                    label.textContent = 'Value:';
+                }} else {{
+                    input.required = true;
+                    input.placeholder = 'User ID';
+                    label.textContent = 'Value:';
+                }}
+            }}
+            
+            function addPermission(event, commandName) {{
+                event.preventDefault();
+                
+                const form = event.target;
+                const permType = form.querySelector('[name="permission_type"]').value;
+                let permValue = form.querySelector('[name="permission_value"]').value.trim();
+                
+                // For admin, use placeholder value; for role/user, require value
+                if (permType === 'admin') {{
+                    permValue = 'any';  // Placeholder value for admin
+                }} else if (!permValue) {{
+                    alert('Please enter a permission value (Role ID or User ID)');
+                    return;
+                }}
+                
+                fetch(`/api/instances/{guild_id}/permissions`, {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                    }},
+                    body: JSON.stringify({{
+                        command_name: commandName,
+                        permission_type: permType,
+                        permission_value: permValue
+                    }})
+                }})
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        alert('Error: ' + data.error);
+                    }} else {{
+                        location.reload();
+                    }}
+                }})
+                .catch(error => {{
+                    alert('Error: ' + error);
+                }});
+            }}
+            
+            function removePermission(commandName, permType, permValue) {{
+                const displayValue = permType === 'admin' ? 'Any server admin' : permValue;
+                if (!confirm(`Remove ${{permType}} permission "${{displayValue}}" from /${{commandName}}?`)) {{
+                    return;
+                }}
+                
+                fetch(`/api/instances/{guild_id}/permissions`, {{
+                    method: 'DELETE',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                    }},
+                    body: JSON.stringify({{
+                        command_name: commandName,
+                        permission_type: permType,
+                        permission_value: permValue
+                    }})
+                }})
+                .then(response => response.json())
+                .then(data => {{
+                    if (data.error) {{
+                        alert('Error: ' + data.error);
+                    }} else {{
+                        location.reload();
+                    }}
+                }})
+                .catch(error => {{
+                    alert('Error: ' + error);
+                }});
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html)
+
+
+@app.route('/api/instances/<guild_id>/permissions', methods=['POST'])
+def api_add_permission(guild_id):
+    """API endpoint to add a command permission."""
+    try:
+        data = request.get_json()
+        command_name = data.get('command_name')
+        permission_type = data.get('permission_type')
+        permission_value = data.get('permission_value', '')
+        
+        if not command_name or not permission_type:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        if permission_type not in ['admin', 'role', 'user']:
+            return jsonify({'error': 'Invalid permission type'}), 400
+        
+        # For admin, use 'any' as placeholder if no value provided
+        # For role/user, require a value
+        if permission_type == 'admin':
+            if not permission_value or permission_value == 'any':
+                permission_value = 'any'
+        elif not permission_value:
+            return jsonify({'error': 'Permission value is required for role and user types'}), 400
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from database import TornDatabase
+            db = TornDatabase(DB_PATH)
+            loop.run_until_complete(db.connect())
+            
+            try:
+                # Ensure instance exists
+                loop.run_until_complete(db.upsert_bot_instance(guild_id))
+                
+                # Add permission
+                loop.run_until_complete(db.set_command_permission(
+                    guild_id, command_name, permission_type, permission_value
+                ))
+            finally:
+                loop.run_until_complete(db.close())
+        finally:
+            loop.close()
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/instances/<guild_id>/permissions', methods=['DELETE'])
+def api_remove_permission(guild_id):
+    """API endpoint to remove a command permission."""
+    try:
+        data = request.get_json()
+        command_name = data.get('command_name')
+        permission_type = data.get('permission_type')
+        permission_value = data.get('permission_value')
+        
+        if not all([command_name, permission_type, permission_value]):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from database import TornDatabase
+            db = TornDatabase(DB_PATH)
+            loop.run_until_complete(db.connect())
+            
+            try:
+                loop.run_until_complete(db.remove_command_permission(
+                    guild_id, command_name, permission_type, permission_value
+                ))
+            finally:
+                loop.run_until_complete(db.close())
+        finally:
+            loop.close()
+        
+        return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

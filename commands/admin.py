@@ -5,6 +5,7 @@ import os
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
+from utils.permissions import check_command_permission, get_bot_database
 
 def parse_duration(duration_str: str) -> timedelta:
     """Parse duration string like '10m', '1h', '30s' into timedelta"""
@@ -46,13 +47,23 @@ def setup(bot: commands.Bot):
     )
     async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
         """Warn command - warns a user"""
-        # Check if user has permission
-        if not interaction.user.guild_permissions.moderate_members:
-            await interaction.response.send_message(
-                "You don't have permission to warn members.",
-                ephemeral=True
-            )
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "warn", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
             return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("warn"):  # No custom permissions set, use Discord default
+                if not interaction.user.guild_permissions.moderate_members:
+                    await interaction.response.send_message(
+                        "You don't have permission to warn members.",
+                        ephemeral=True
+                    )
+                    return
         
         # Can't warn yourself
         if user.id == interaction.user.id:
@@ -289,13 +300,23 @@ def setup(bot: commands.Bot):
     )
     async def sync_commands_slash(interaction: discord.Interaction, force_guild: bool = True):
         """Sync commands slash command - manually triggers command sync and validation"""
-        # Check if user has permission (administrator or manage guild)
-        if not (interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild):
-            await interaction.response.send_message(
-                "You don't have permission to sync commands. Administrator or Manage Server permission required.",
-                ephemeral=True
-            )
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "sync-commands", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
             return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("sync-commands"):  # No custom permissions set, use Discord default
+                if not (interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild):
+                    await interaction.response.send_message(
+                        "You don't have permission to sync commands. Administrator or Manage Server permission required.",
+                        ephemeral=True
+                    )
+                    return
         
         await interaction.response.defer(ephemeral=True)
         
@@ -338,13 +359,23 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="db-health", description="View database health metrics (Admin only)")
     async def db_health(interaction: discord.Interaction):
         """Display database health metrics."""
-        # Check if user has permission
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to view database metrics.",
-                ephemeral=True
-            )
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "db-health", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
             return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("db-health"):  # No custom permissions set, use Discord default
+                if not interaction.user.guild_permissions.administrator:
+                    await interaction.response.send_message(
+                        "You don't have permission to view database metrics.",
+                        ephemeral=True
+                    )
+                    return
         
         await interaction.response.defer(ephemeral=True)
         
@@ -471,9 +502,19 @@ def setup(bot: commands.Bot):
         filter: Optional[str] = None
     ):
         """Query database tables with pagination."""
-        # Check permissions
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "db-query", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("db-query"):  # No custom permissions set, use Discord default
+                if not interaction.user.guild_permissions.administrator:
+                    await interaction.response.send_message(
                 "You don't have permission to query the database.",
                 ephemeral=True
             )
@@ -607,12 +648,23 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="db-tables", description="List all available database tables (Admin only)")
     async def db_tables(interaction: discord.Interaction):
         """List all available database tables."""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to view database tables.",
-                ephemeral=True
-            )
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "db-tables", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
             return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("db-tables"):  # No custom permissions set, use Discord default
+                if not interaction.user.guild_permissions.administrator:
+                    await interaction.response.send_message(
+                        "You don't have permission to view database tables.",
+                        ephemeral=True
+                    )
+                    return
         
         await interaction.response.defer(ephemeral=True)
         

@@ -288,6 +288,21 @@ def setup(bot: commands.Bot):
         num_teams: int = 4
     ):
         """Create a new competition."""
+        # Check permissions (if set in database, otherwise allow everyone)
+        try:
+            from utils.permissions import check_command_permission, get_bot_database
+            db = get_bot_database(bot)
+            if db:
+                has_permission, error_msg = await check_command_permission(interaction, "competition-create", db)
+                if not has_permission:
+                    await interaction.response.send_message(
+                        error_msg or "You don't have permission to use this command.",
+                        ephemeral=True
+                    )
+                    return
+        except Exception:
+            pass  # If permission check fails, allow command (fail open)
+        
         await interaction.response.defer(ephemeral=True)
         
         if not await check_database_available(bot, interaction):
@@ -398,8 +413,8 @@ def setup(bot: commands.Bot):
     )
     async def competition_cancel(interaction: discord.Interaction, competition_id: int):
         """Cancel a competition."""
-        # Check admin permission
-        if not await require_admin(interaction):
+        # Check admin permission (checks database permissions first)
+        if not await require_admin(interaction, "competition-cancel", bot):
             return
         
         await interaction.response.defer(ephemeral=True)
@@ -750,7 +765,7 @@ def setup(bot: commands.Bot):
         captain_2: Optional[str] = None
     ):
         """Set team captains."""
-        if not await require_admin(interaction):
+        if not await require_admin(interaction, "competition-team-set-captains", bot):
             return
         
         await interaction.response.defer(ephemeral=True)
@@ -800,7 +815,7 @@ def setup(bot: commands.Bot):
         player_ids: Optional[str] = None
     ):
         """Add participants from a faction and randomly assign them to teams."""
-        if not await require_admin(interaction):
+        if not await require_admin(interaction, "competition-add-participants", bot):
             return
         
         await interaction.response.defer(ephemeral=True)
@@ -932,7 +947,7 @@ def setup(bot: commands.Bot):
         team_id: int
     ):
         """Update a participant's team assignment."""
-        if not await require_admin(interaction):
+        if not await require_admin(interaction, "competition-update-assignment", bot):
             return
         
         await interaction.response.defer(ephemeral=True)
@@ -980,7 +995,7 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="competition-update-stats", description="Manually trigger stat update for active competitions (Admin only)")
     async def competition_update_stats(interaction: discord.Interaction):
         """Manually trigger stat updates for all active competitions."""
-        if not await require_admin(interaction):
+        if not await require_admin(interaction, "competition-update-stats", bot):
             return
         
         await interaction.response.defer(ephemeral=True)

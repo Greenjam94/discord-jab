@@ -287,6 +287,45 @@ async def before_daily_competition_task():
     # Wait until next hour to avoid running immediately on startup
     await asyncio.sleep(3600)  # Wait 1 hour
 
+@tasks.loop(minutes=2)  # Update every 2 minutes (for heartbeat)
+async def update_bot_instances_task():
+    """Background task to update bot instance statuses and heartbeat."""
+    if not hasattr(bot, 'database') or not bot.database:
+        return
+    
+    try:
+        guild_ids = []
+        # Update all current guilds as active
+        for guild in bot.guilds:
+            try:
+                guild_id_str = str(guild.id)
+                guild_ids.append(guild_id_str)
+                await bot.database.upsert_bot_instance(
+                    guild_id_str,
+                    guild.name,
+                    'active',
+                    guild.member_count,
+                    bot_online=True
+                )
+            except Exception as e:
+                print(f'⚠️  Failed to update instance {guild.id}: {e}')
+        
+        # Update heartbeat timestamp for all current guilds
+        if guild_ids:
+            try:
+                await bot.database.update_bot_heartbeat(guild_ids)
+            except Exception as e:
+                print(f'⚠️  Failed to update heartbeat: {e}')
+        
+    except Exception as e:
+        print(f'❌ Error updating bot instances: {e}')
+
+@update_bot_instances_task.before_loop
+async def before_update_instances_task():
+    """Wait until bot is ready before starting the task."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)  # Wait 1 minute after ready
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
@@ -332,6 +371,37 @@ async def on_ready():
     # Sync commands with validation
     await sync_commands_with_validation(bot)
     
+    # Register all current guilds as bot instances
+    if bot.database:
+            try:
+                guild_ids = []
+                for guild in bot.guilds:
+                    guild_id_str = str(guild.id)
+                    guild_ids.append(guild_id_str)
+                    await bot.database.upsert_bot_instance(
+                        guild_id_str,
+                        guild.name,
+                        'active',
+                        guild.member_count,
+                        bot_online=True
+                    )
+                
+                # Update heartbeat immediately
+                if guild_ids:
+                    await bot.database.update_bot_heartbeat(guild_ids)
+                
+                print(f'✅ Registered {len(bot.guilds)} bot instance(s)')
+            except Exception as e:
+                print(f'⚠️  Failed to register bot instances: {e}')
+    
+    # Connect Flask app to bot for status checks
+    try:
+        import web_app
+        web_app.set_bot_instance(bot)
+        print('✅ Connected Flask app to bot instance')
+    except Exception as e:
+        print(f'⚠️  Failed to connect Flask app: {e}')
+    
     # Start monthly summarization task
     if bot.database:
         monthly_summarization_task.start()
@@ -340,6 +410,47 @@ async def on_ready():
         # Start daily competition stats update task
         daily_competition_stats_update_task.start()
         print('✅ Daily competition stats update task started')
+        
+        # Start bot instances update task
+        update_bot_instances_task.start()
+        print('✅ Bot instances update task started')
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Handle bot joining a new guild."""
+    print(f'✅ Bot joined guild: {guild.name} (ID: {guild.id})')
+    
+    # Register the new instance
+    if hasattr(bot, 'database') and bot.database:
+        try:
+            await bot.database.upsert_bot_instance(
+                str(guild.id),
+                guild.name,
+                'active',
+                guild.member_count
+            )
+            print(f'✅ Registered new bot instance: {guild.name}')
+        except Exception as e:
+            print(f'⚠️  Failed to register new bot instance: {e}')
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """Handle bot leaving a guild."""
+    print(f'⚠️  Bot left guild: {guild.name} (ID: {guild.id})')
+    
+    # Update instance status
+    if hasattr(bot, 'database') and bot.database:
+        try:
+            await bot.database.upsert_bot_instance(
+                str(guild.id),
+                guild.name,
+                'inactive',
+                None,
+                bot_online=False
+            )
+            print(f'✅ Updated bot instance status: {guild.name} -> inactive')
+        except Exception as e:
+            print(f'⚠️  Failed to update bot instance status: {e}')
 
 @bot.event
 async def on_disconnect():

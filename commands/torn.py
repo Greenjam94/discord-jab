@@ -5,6 +5,7 @@ from discord.ext import commands
 from torn_api import TornAPIClient, TornKeyManager
 from torn_api.client import TornAPIError
 from typing import Optional
+from utils.permissions import check_command_permission, get_bot_database
 
 
 def setup(bot: commands.Bot):
@@ -27,13 +28,23 @@ def setup(bot: commands.Bot):
         owner: Optional[str] = None
     ):
         """Add a new Torn API key to the registry."""
-        # Check admin permission
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "❌ You need administrator permissions to add API keys.",
-                ephemeral=True
-            )
+        # Check database permissions first
+        db = get_bot_database(bot)
+        has_permission, error_msg = await check_command_permission(interaction, "torn-key-add", db)
+        if not has_permission:
+            await interaction.response.send_message(error_msg or "You don't have permission to use this command.", ephemeral=True)
             return
+        
+        # Legacy check: if no DB permissions set, fall back to Discord permissions
+        if db:
+            perms = await db.get_command_permissions(str(interaction.guild.id))
+            if not perms.get("torn-key-add"):  # No custom permissions set, use Discord default
+                if not interaction.user.guild_permissions.administrator:
+                    await interaction.response.send_message(
+                        "❌ You need administrator permissions to add API keys.",
+                        ephemeral=True
+                    )
+                    return
         
         await interaction.response.defer(ephemeral=True)
         

@@ -12,7 +12,7 @@ import json
 class TornDatabase:
     """Manages SQLite database for Torn API data."""
     
-    CURRENT_SCHEMA_VERSION = 3
+    CURRENT_SCHEMA_VERSION = 4
     
     def __init__(self, db_path: str = "data/torn_data.db"):
         """Initialize database manager.
@@ -61,6 +61,10 @@ class TornDatabase:
         if current_version < 3:
             await self._create_schema_v3()
             await self._set_schema_version(3, "Added contributor stats support and stat_source column")
+        
+        if current_version < 4:
+            await self._create_schema_v4()
+            await self._set_schema_version(4, "Added bot instances and command permissions tables")
     
     async def _get_schema_version(self) -> int:
         """Get current schema version."""
@@ -1189,6 +1193,185 @@ class TornDatabase:
             ON player_contributor_history(faction_id)
         """)
         
+        await self.connection.commit()
+    
+    async def _create_schema_v4(self):
+        """Create schema v4: Add bot instances and command permissions."""
+        # Bot instances table (tracks Discord guilds/servers where bot is deployed)
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS bot_instances (
+                guild_id TEXT PRIMARY KEY,
+                guild_name TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'unknown')),
+                last_seen INTEGER,
+                member_count INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+        
+        # Command permissions table (maps commands to allowed users/roles per instance)
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS command_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                command_name TEXT NOT NULL,
+                permission_type TEXT NOT NULL CHECK (permission_type IN ('admin', 'role', 'user')),
+                permission_value TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (guild_id) REFERENCES bot_instances(guild_id) ON DELETE CASCADE,
+                UNIQUE(guild_id, command_name, permission_type, permission_value)
+            )
+        """)
+        
+        # Create indexes
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_command_permissions_guild_command 
+            ON command_permissions(guild_id, command_name)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_command_permissions_type_value 
+            ON command_permissions(permission_type, permission_value)
+        """)
+        
+        await self.connection.commit()
+    
+    # Bot instance and permission methods
+    async def get_bot_instances(self) -> List[Dict[str, Any]]:
+        """Get all bot instances."""
+        instances = []
+        async with self.connection.execute("""
+            SELECT guild_id, guild_name, status, last_seen, member_count, created_at, updated_at
+            FROM bot_instances
+            ORDER BY guild_name, guild_id
+        """) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                instances.append({
+                    'guild_id': row[0],
+                    'guild_name': row[1],
+                    'status': row[2],
+                    'last_seen': row[3],
+                    'member_count': row[4],
+                    'created_at': row[5],
+                    'updated_at': row[6]
+                })
+        return instances
+    
+    async def upsert_bot_instance(
+        self,
+        guild_id: str,
+        guild_name: Optional[str] = None,
+        status: str = 'active',
+        member_count: Optional[int] = None,
+        bot_online: bool = True
+    ):
+        """Create or update a bot instance."""
+        import time
+        current_time = int(time.time())
+        
+        # If bot_online is False, mark as inactive
+        if not bot_online:
+            status = 'inactive'
+        
+        await self.connection.execute("""
+            INSERT INTO bot_instances (guild_id, guild_name, status, last_seen, member_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                guild_name = COALESCE(excluded.guild_name, bot_instances.guild_name),
+                status = excluded.status,
+                last_seen = excluded.last_seen,
+                member_count = COALESCE(excluded.member_count, bot_instances.member_count),
+                updated_at = excluded.updated_at
+        """, (guild_id, guild_name, status, current_time, member_count, current_time))
+        await self.connection.commit()
+    
+    async def update_bot_heartbeat(self, guild_ids: List[str] = None):
+        """Update heartbeat timestamp for specified guilds or all active guilds.
+        
+        Args:
+            guild_ids: Optional list of guild IDs to update. If None, updates all active guilds.
+        """
+        import time
+        current_time = int(time.time())
+        
+        if guild_ids:
+            # Update specified guilds
+            for guild_id in guild_ids:
+                await self.connection.execute("""
+                    UPDATE bot_instances 
+                    SET last_seen = ?, updated_at = ?, status = 'active'
+                    WHERE guild_id = ?
+                """, (current_time, current_time, guild_id))
+        else:
+            # Update all active guilds
+            async with self.connection.execute("""
+                SELECT guild_id FROM bot_instances WHERE status != 'inactive'
+            """) as cursor:
+                guilds = await cursor.fetchall()
+                for (guild_id,) in guilds:
+                    await self.connection.execute("""
+                        UPDATE bot_instances 
+                        SET last_seen = ?, updated_at = ?, status = 'active'
+                        WHERE guild_id = ?
+                    """, (current_time, current_time, guild_id))
+        await self.connection.commit()
+    
+    async def get_command_permissions(self, guild_id: str) -> Dict[str, List[Dict[str, str]]]:
+        """Get all command permissions for a guild, organized by command."""
+        permissions = {}
+        async with self.connection.execute("""
+            SELECT command_name, permission_type, permission_value
+            FROM command_permissions
+            WHERE guild_id = ?
+            ORDER BY command_name, permission_type, permission_value
+        """, (guild_id,)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                command_name, perm_type, perm_value = row
+                if command_name not in permissions:
+                    permissions[command_name] = []
+                permissions[command_name].append({
+                    'type': perm_type,
+                    'value': perm_value
+                })
+        return permissions
+    
+    async def set_command_permission(
+        self,
+        guild_id: str,
+        command_name: str,
+        permission_type: str,
+        permission_value: str
+    ):
+        """Add a permission for a command."""
+        await self.connection.execute("""
+            INSERT OR IGNORE INTO command_permissions (guild_id, command_name, permission_type, permission_value)
+            VALUES (?, ?, ?, ?)
+        """, (guild_id, command_name, permission_type, permission_value))
+        await self.connection.commit()
+    
+    async def remove_command_permission(
+        self,
+        guild_id: str,
+        command_name: str,
+        permission_type: str,
+        permission_value: str
+    ):
+        """Remove a permission for a command."""
+        await self.connection.execute("""
+            DELETE FROM command_permissions
+            WHERE guild_id = ? AND command_name = ? AND permission_type = ? AND permission_value = ?
+        """, (guild_id, command_name, permission_type, permission_value))
+        await self.connection.commit()
+    
+    async def clear_command_permissions(self, guild_id: str, command_name: str):
+        """Clear all permissions for a command."""
+        await self.connection.execute("""
+            DELETE FROM command_permissions
+            WHERE guild_id = ? AND command_name = ?
+        """, (guild_id, command_name))
         await self.connection.commit()
     
     # Competition methods

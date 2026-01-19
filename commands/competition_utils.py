@@ -99,15 +99,41 @@ async def validate_competition_exists(bot: commands.Bot, competition_id: int, in
     return comp
 
 
-async def require_admin(interaction: discord.Interaction) -> bool:
-    """Check if user has admin permissions.
+async def require_admin(interaction: discord.Interaction, command_name: str = None, bot: commands.Bot = None) -> bool:
+    """Check if user has admin permissions using database permissions or Discord admin.
     
     Args:
         interaction: Discord interaction
-        
+        command_name: Optional command name to check database permissions
+        bot: Optional bot instance (required if command_name provided)
+    
     Returns:
         True if admin, False otherwise (error already sent)
     """
+    # If command_name and bot provided, check database permissions first
+    if command_name and bot:
+        try:
+            from utils.permissions import check_command_permission, get_bot_database
+            db = get_bot_database(bot)
+            has_permission, error_msg = await check_command_permission(interaction, command_name, db)
+            
+            if not has_permission:
+                await interaction.response.send_message(
+                    error_msg or "❌ You don't have permission to use this command.",
+                    ephemeral=True
+                )
+                return False
+            
+            # If database has permissions set and user passed, allow
+            if db:
+                perms = await db.get_command_permissions(str(interaction.guild.id))
+                if perms.get(command_name):  # Custom permissions are set
+                    return True  # Already passed the check above
+        except Exception as e:
+            print(f"Warning: Error checking database permissions: {e}")
+            # Fall through to Discord permission check
+    
+    # Fall back to Discord admin permission check
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             "❌ You need administrator permissions to perform this action.",
