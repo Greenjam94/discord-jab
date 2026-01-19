@@ -12,7 +12,7 @@ import json
 class TornDatabase:
     """Manages SQLite database for Torn API data."""
     
-    CURRENT_SCHEMA_VERSION = 1
+    CURRENT_SCHEMA_VERSION = 3
     
     def __init__(self, db_path: str = "data/torn_data.db"):
         """Initialize database manager.
@@ -52,7 +52,15 @@ class TornDatabase:
         
         if current_version < 1:
             await self._create_schema_v1()
-            await self._set_schema_version(1)
+            await self._set_schema_version(1, "Initial schema")
+        
+        if current_version < 2:
+            await self._create_schema_v2()
+            await self._set_schema_version(2, "Added competition tracking tables")
+        
+        if current_version < 3:
+            await self._create_schema_v3()
+            await self._set_schema_version(3, "Added contributor stats support and stat_source column")
     
     async def _get_schema_version(self) -> int:
         """Get current schema version."""
@@ -478,6 +486,35 @@ class TornDatabase:
               total_stats, level, life_maximum, networth, data_source))
         await self.connection.commit()
     
+    async def append_player_contributor_history(
+        self,
+        player_id: int,
+        stat_name: str,
+        value: float,
+        faction_id: Optional[int] = None,
+        data_source: Optional[str] = None,
+        timestamp: Optional[int] = None
+    ):
+        """Append player contributor stat to history.
+        
+        Args:
+            player_id: Torn player ID
+            stat_name: Name of the contributor stat (e.g., 'gymstrength', 'gym_e_spent')
+            value: The contributor value
+            faction_id: Faction ID this was collected from
+            data_source: Masked API key used
+            timestamp: Optional timestamp (defaults to current time)
+        """
+        if timestamp is None:
+            timestamp = int(datetime.utcnow().timestamp())
+        
+        await self.connection.execute("""
+            INSERT OR REPLACE INTO player_contributor_history
+            (player_id, stat_name, timestamp, value, faction_id, data_source)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (player_id, stat_name, timestamp, value, faction_id, data_source))
+        await self.connection.commit()
+    
     async def append_faction_history(
         self,
         faction_id: int,
@@ -764,26 +801,46 @@ class TornDatabase:
         
         return summaries_created
     
+    async def _prune_history_table(
+        self,
+        table_name: str,
+        timestamp_column: str,
+        older_than_days: int
+    ) -> int:
+        """Generic helper to prune history tables.
+        
+        Args:
+            table_name: Name of the table to prune
+            timestamp_column: Name of the timestamp column
+            older_than_days: Days threshold for pruning
+            
+        Returns:
+            Number of records deleted
+        """
+        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=older_than_days)).timestamp())
+        
+        async with self.connection.execute(
+            f"SELECT COUNT(*) FROM {table_name} WHERE {timestamp_column} < ?",
+            (cutoff_timestamp,)
+        ) as cursor:
+            count_row = await cursor.fetchone()
+            count = count_row[0] if count_row else 0
+        
+        await self.connection.execute(
+            f"DELETE FROM {table_name} WHERE {timestamp_column} < ?",
+            (cutoff_timestamp,)
+        )
+        await self.connection.commit()
+        
+        return count
+    
     async def prune_player_stats_history(self, older_than_days: int = 60) -> int:
         """Prune player stats history older than specified days.
         
         Returns:
             Number of records deleted
         """
-        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=older_than_days)).timestamp())
-        
-        async with self.connection.execute("""
-            SELECT COUNT(*) FROM player_stats_history WHERE timestamp < ?
-        """, (cutoff_timestamp,)) as cursor:
-            count_row = await cursor.fetchone()
-            count = count_row[0] if count_row else 0
-        
-        await self.connection.execute("""
-            DELETE FROM player_stats_history WHERE timestamp < ?
-        """, (cutoff_timestamp,))
-        await self.connection.commit()
-        
-        return count
+        return await self._prune_history_table("player_stats_history", "timestamp", older_than_days)
     
     async def summarize_faction_history_monthly(self, year: int, month: int, force: bool = False) -> int:
         """Summarize faction history for a specific month.
@@ -1007,20 +1064,7 @@ class TornDatabase:
         Returns:
             Number of records deleted
         """
-        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=older_than_days)).timestamp())
-        
-        async with self.connection.execute("""
-            SELECT COUNT(*) FROM faction_history WHERE timestamp < ?
-        """, (cutoff_timestamp,)) as cursor:
-            count_row = await cursor.fetchone()
-            count = count_row[0] if count_row else 0
-        
-        await self.connection.execute("""
-            DELETE FROM faction_history WHERE timestamp < ?
-        """, (cutoff_timestamp,))
-        await self.connection.commit()
-        
-        return count
+        return await self._prune_history_table("faction_history", "timestamp", older_than_days)
     
     async def prune_territory_ownership_history(self, older_than_days: int = 60) -> int:
         """Prune territory ownership history older than specified days.
@@ -1028,17 +1072,404 @@ class TornDatabase:
         Returns:
             Number of records deleted
         """
-        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=older_than_days)).timestamp())
+        return await self._prune_history_table("territory_ownership_history", "recorded_at", older_than_days)
+    
+    async def _create_schema_v2(self):
+        """Create competition tracking schema (version 2)."""
+        # Competitions table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS competitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                tracked_stat TEXT NOT NULL,
+                start_date INTEGER NOT NULL,
+                end_date INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled', 'completed')),
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                created_by TEXT NOT NULL,
+                UNIQUE(name)
+            )
+        """)
         
-        async with self.connection.execute("""
-            SELECT COUNT(*) FROM territory_ownership_history WHERE recorded_at < ?
-        """, (cutoff_timestamp,)) as cursor:
-            count_row = await cursor.fetchone()
-            count = count_row[0] if count_row else 0
+        # Competition teams table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS competition_teams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                competition_id INTEGER NOT NULL,
+                team_name TEXT NOT NULL,
+                captain_discord_id_1 TEXT NOT NULL,
+                captain_discord_id_2 TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (competition_id) REFERENCES competitions(id) ON DELETE CASCADE,
+                UNIQUE(competition_id, team_name)
+            )
+        """)
+        
+        # Competition participants table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS competition_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                competition_id INTEGER NOT NULL,
+                team_id INTEGER,
+                player_id INTEGER NOT NULL,
+                discord_user_id TEXT,
+                assigned_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (competition_id) REFERENCES competitions(id) ON DELETE CASCADE,
+                FOREIGN KEY (team_id) REFERENCES competition_teams(id) ON DELETE SET NULL,
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
+                UNIQUE(competition_id, player_id)
+            )
+        """)
+        
+        # Competition start stats cache table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS competition_start_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                competition_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                stat_value REAL,
+                recorded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (competition_id) REFERENCES competitions(id) ON DELETE CASCADE,
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
+                UNIQUE(competition_id, player_id)
+            )
+        """)
+        
+        # Create indexes for competitions
+        competition_indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_competitions_status ON competitions(status, start_date)",
+            "CREATE INDEX IF NOT EXISTS idx_competitions_dates ON competitions(start_date, end_date)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_teams_competition ON competition_teams(competition_id)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_teams_captains ON competition_teams(captain_discord_id_1, captain_discord_id_2)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_participants_competition ON competition_participants(competition_id)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_participants_team ON competition_participants(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_participants_player ON competition_participants(player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_competition_start_stats_competition ON competition_start_stats(competition_id, player_id)",
+        ]
+        
+        for index_sql in competition_indexes:
+            await self.connection.execute(index_sql)
+        
+        await self.connection.commit()
+    
+    async def _create_schema_v3(self):
+        """Create schema v3: Add contributor stats support."""
+        # Add stat_source column to competition_start_stats
+        try:
+            await self.connection.execute("""
+                ALTER TABLE competition_start_stats 
+                ADD COLUMN stat_source TEXT DEFAULT 'contributors'
+            """)
+        except aiosqlite.OperationalError:
+            # Column might already exist, ignore
+            pass
+        
+        # Create player_contributor_history table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS player_contributor_history (
+                player_id INTEGER NOT NULL,
+                stat_name TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                value REAL NOT NULL,
+                faction_id INTEGER,
+                data_source TEXT,
+                PRIMARY KEY (player_id, stat_name, timestamp),
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        """)
+        
+        # Create indexes for contributor history
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_player_contributor_history_player_stat 
+            ON player_contributor_history(player_id, stat_name, timestamp DESC)
+        """)
         
         await self.connection.execute("""
-            DELETE FROM territory_ownership_history WHERE recorded_at < ?
-        """, (cutoff_timestamp,))
-        await self.connection.commit()
+            CREATE INDEX IF NOT EXISTS idx_player_contributor_history_faction 
+            ON player_contributor_history(faction_id)
+        """)
         
-        return count
+        await self.connection.commit()
+    
+    # Competition methods
+    async def create_competition(
+        self,
+        name: str,
+        tracked_stat: str,
+        start_date: int,
+        end_date: int,
+        created_by: str
+    ) -> int:
+        """Create a new competition.
+        
+        Returns:
+            Competition ID
+        """
+        cursor = await self.connection.execute("""
+            INSERT INTO competitions (name, tracked_stat, start_date, end_date, created_by)
+            VALUES (?, ?, ?, ?, ?)
+        """, (name, tracked_stat, start_date, end_date, created_by))
+        await self.connection.commit()
+        return cursor.lastrowid
+    
+    async def create_competition_team(
+        self,
+        competition_id: int,
+        team_name: str,
+        captain_discord_id_1: str,
+        captain_discord_id_2: Optional[str] = None
+    ) -> int:
+        """Create a team for a competition.
+        
+        Returns:
+            Team ID
+        """
+        cursor = await self.connection.execute("""
+            INSERT INTO competition_teams (competition_id, team_name, captain_discord_id_1, captain_discord_id_2)
+            VALUES (?, ?, ?, ?)
+        """, (competition_id, team_name, captain_discord_id_1, captain_discord_id_2))
+        await self.connection.commit()
+        return cursor.lastrowid
+    
+    async def add_competition_participant(
+        self,
+        competition_id: int,
+        player_id: int,
+        team_id: Optional[int] = None,
+        discord_user_id: Optional[str] = None
+    ):
+        """Add a participant to a competition."""
+        await self.connection.execute("""
+            INSERT OR REPLACE INTO competition_participants
+            (competition_id, team_id, player_id, discord_user_id)
+            VALUES (?, ?, ?, ?)
+        """, (competition_id, team_id, player_id, discord_user_id))
+        await self.connection.commit()
+    
+    async def set_competition_start_stat(
+        self,
+        competition_id: int,
+        player_id: int,
+        stat_value: Optional[float],
+        stat_source: str = "contributors"
+    ):
+        """Set or update the starting stat value for a competition participant."""
+        await self.connection.execute("""
+            INSERT OR REPLACE INTO competition_start_stats
+            (competition_id, player_id, stat_value, stat_source)
+            VALUES (?, ?, ?, ?)
+        """, (competition_id, player_id, stat_value, stat_source))
+        await self.connection.commit()
+    
+    async def get_competition(self, competition_id: int) -> Optional[Dict[str, Any]]:
+        """Get competition details."""
+        async with self.connection.execute("""
+            SELECT id, name, tracked_stat, start_date, end_date, status, created_at, created_by
+            FROM competitions WHERE id = ?
+        """, (competition_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "name": row[1],
+                "tracked_stat": row[2],
+                "start_date": row[3],
+                "end_date": row[4],
+                "status": row[5],
+                "created_at": row[6],
+                "created_by": row[7]
+            }
+    
+    async def get_competition_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get competition by name."""
+        async with self.connection.execute("""
+            SELECT id, name, tracked_stat, start_date, end_date, status, created_at, created_by
+            FROM competitions WHERE name = ?
+        """, (name,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "name": row[1],
+                "tracked_stat": row[2],
+                "start_date": row[3],
+                "end_date": row[4],
+                "status": row[5],
+                "created_at": row[6],
+                "created_by": row[7]
+            }
+    
+    async def list_competitions(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List competitions, optionally filtered by status."""
+        if status:
+            async with self.connection.execute("""
+                SELECT id, name, tracked_stat, start_date, end_date, status, created_at, created_by
+                FROM competitions WHERE status = ? ORDER BY start_date DESC
+            """, (status,)) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            async with self.connection.execute("""
+                SELECT id, name, tracked_stat, start_date, end_date, status, created_at, created_by
+                FROM competitions ORDER BY start_date DESC
+            """) as cursor:
+                rows = await cursor.fetchall()
+        
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "tracked_stat": row[2],
+                "start_date": row[3],
+                "end_date": row[4],
+                "status": row[5],
+                "created_at": row[6],
+                "created_by": row[7]
+            }
+            for row in rows
+        ]
+    
+    async def cancel_competition(self, competition_id: int):
+        """Cancel a competition."""
+        await self.connection.execute("""
+            UPDATE competitions SET status = 'cancelled' WHERE id = ?
+        """, (competition_id,))
+        await self.connection.commit()
+    
+    async def get_competition_teams(self, competition_id: int) -> List[Dict[str, Any]]:
+        """Get all teams for a competition."""
+        async with self.connection.execute("""
+            SELECT id, competition_id, team_name, captain_discord_id_1, captain_discord_id_2, created_at
+            FROM competition_teams WHERE competition_id = ?
+        """, (competition_id,)) as cursor:
+            rows = await cursor.fetchall()
+        
+        return [
+            {
+                "id": row[0],
+                "competition_id": row[1],
+                "team_name": row[2],
+                "captain_discord_id_1": row[3],
+                "captain_discord_id_2": row[4],
+                "created_at": row[5]
+            }
+            for row in rows
+        ]
+    
+    async def get_competition_participants(self, competition_id: int) -> List[Dict[str, Any]]:
+        """Get all participants for a competition."""
+        async with self.connection.execute("""
+            SELECT cp.id, cp.competition_id, cp.team_id, cp.player_id, cp.discord_user_id, cp.assigned_at,
+                   p.name as player_name
+            FROM competition_participants cp
+            LEFT JOIN players p ON cp.player_id = p.player_id
+            WHERE cp.competition_id = ?
+        """, (competition_id,)) as cursor:
+            rows = await cursor.fetchall()
+        
+        return [
+            {
+                "id": row[0],
+                "competition_id": row[1],
+                "team_id": row[2],
+                "player_id": row[3],
+                "discord_user_id": row[4],
+                "assigned_at": row[5],
+                "player_name": row[6]
+            }
+            for row in rows
+        ]
+    
+    async def get_player_current_stat_value(
+        self,
+        player_id: int,
+        stat_name: str
+    ) -> Optional[float]:
+        """Get the most recent value for a stat from contributor history or player_stats_history."""
+        # First try contributor history (for contributor-based stats)
+        async with self.connection.execute("""
+            SELECT value FROM player_contributor_history
+            WHERE player_id = ? AND stat_name = ?
+            ORDER BY timestamp DESC LIMIT 1
+        """, (player_id, stat_name)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        
+        # Fallback to old player_stats_history for backward compatibility
+        # (though we're removing user endpoint stats, keeping this for now)
+        stat_column_map = {
+            "strength": "strength",
+            "defense": "defense",
+            "speed": "speed",
+            "dexterity": "dexterity",
+            "total_stats": "total_stats",
+            "level": "level",
+            "life_maximum": "life_maximum",
+            "networth": "networth"
+        }
+        
+        if stat_name in stat_column_map:
+            column = stat_column_map[stat_name]
+            async with self.connection.execute(f"""
+                SELECT {column} FROM player_stats_history
+                WHERE player_id = ? AND {column} IS NOT NULL
+                ORDER BY timestamp DESC LIMIT 1
+            """, (player_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0] is not None:
+                    return float(row[0])
+        
+        # Fallback to players table for level
+        if stat_name == "level":
+            async with self.connection.execute("""
+                SELECT level FROM players WHERE player_id = ?
+            """, (player_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0] is not None:
+                    return float(row[0])
+        
+        return None
+    
+    async def get_competition_start_stat(
+        self,
+        competition_id: int,
+        player_id: int
+    ) -> Optional[float]:
+        """Get the starting stat value for a participant."""
+        async with self.connection.execute("""
+            SELECT stat_value FROM competition_start_stats
+            WHERE competition_id = ? AND player_id = ?
+        """, (competition_id, player_id)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0] if row[0] is not None else None
+            return None
+    
+    async def update_participant_team(
+        self,
+        competition_id: int,
+        player_id: int,
+        team_id: Optional[int]
+    ):
+        """Update a participant's team assignment."""
+        await self.connection.execute("""
+            UPDATE competition_participants SET team_id = ?
+            WHERE competition_id = ? AND player_id = ?
+        """, (team_id, competition_id, player_id))
+        await self.connection.commit()
+    
+    async def update_team_captains(
+        self,
+        team_id: int,
+        captain_discord_id_1: str,
+        captain_discord_id_2: Optional[str] = None
+    ):
+        """Update team captains."""
+        await self.connection.execute("""
+            UPDATE competition_teams
+            SET captain_discord_id_1 = ?, captain_discord_id_2 = ?
+            WHERE id = ?
+        """, (captain_discord_id_1, captain_discord_id_2, team_id))
+        await self.connection.commit()
