@@ -259,6 +259,34 @@ async def before_monthly_task():
     # Wait until next hour to avoid running immediately on startup
     await asyncio.sleep(3600)  # Wait 1 hour
 
+@tasks.loop(hours=24)  # Run daily
+async def daily_competition_stats_update_task():
+    """Background task to update stats for all active competitions daily."""
+    if not hasattr(bot, 'database') or not bot.database:
+        return
+    
+    print('📊 Starting daily competition stats update...')
+    
+    try:
+        from commands.competitions import _update_competition_stats_helper
+        result = await _update_competition_stats_helper(bot)
+        
+        if result.get("error"):
+            print(f'❌ Daily competition stats update error: {result.get("error")}')
+        else:
+            print(f'✅ Daily competition stats update completed: {result.get("message")}')
+    except Exception as e:
+        print(f'❌ Daily competition stats update error: {e}')
+        import traceback
+        traceback.print_exc()
+
+@daily_competition_stats_update_task.before_loop
+async def before_daily_competition_task():
+    """Wait until bot is ready before starting the task."""
+    await bot.wait_until_ready()
+    # Wait until next hour to avoid running immediately on startup
+    await asyncio.sleep(3600)  # Wait 1 hour
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
@@ -281,11 +309,12 @@ async def on_ready():
     
     # Load command modules
     try:
-        from commands import admin, games, torn
+        from commands import admin, games, torn, competitions
         admin.setup(bot)
         games.setup(bot)
         torn.setup(bot)
-        print('Loaded command modules: admin, games, torn')
+        competitions.setup(bot)
+        print('Loaded command modules: admin, games, torn, competitions')
     except Exception as e:
         print(f'Failed to load command modules: {e}')
     
@@ -307,6 +336,10 @@ async def on_ready():
     if bot.database:
         monthly_summarization_task.start()
         print('✅ Monthly summarization task started')
+        
+        # Start daily competition stats update task
+        daily_competition_stats_update_task.start()
+        print('✅ Daily competition stats update task started')
 
 @bot.event
 async def on_disconnect():

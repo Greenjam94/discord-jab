@@ -147,9 +147,17 @@ class TornAPIClient:
         self,
         key: str,
         faction_id: Optional[int] = None,
-        selections: Optional[list] = None
+        selections: Optional[list] = None,
+        stat: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get faction information."""
+        """Get faction information.
+        
+        Args:
+            key: API key
+            faction_id: Optional faction ID (uses key owner's faction if not provided)
+            selections: List of selections (e.g., ['basic', 'contributors'])
+            stat: Optional stat name for contributors selection (e.g., 'gymstrength')
+        """
         endpoint = "faction"
         if faction_id:
             endpoint = f"faction/{faction_id}"
@@ -157,6 +165,10 @@ class TornAPIClient:
         params = {}
         if selections:
             params['selections'] = ','.join(selections)
+        
+        # Add stat parameter if provided (required for contributors selection)
+        if stat:
+            params['stat'] = stat
         
         return await self._make_request(endpoint, key, params)
     
