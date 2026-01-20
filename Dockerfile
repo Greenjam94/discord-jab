@@ -20,10 +20,6 @@ COPY database/ ./database/
 COPY utils/ ./utils/
 COPY torn_api/ ./torn_api/
 
-# Copy data/api_inventory files (static API inventory JSON files)
-# These are static JSON files that should be part of the image
-COPY data/api_inventory/ ./data/api_inventory/
-
 # Create data directory for database (will be volume mounted)
 # The database file itself will be stored in a Docker volume
 RUN mkdir -p /app/data
