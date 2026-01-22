@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 import os
 import sys
+import json
 
 app = Flask(__name__)
 
@@ -630,6 +631,7 @@ def index():
     nav_html = """
     <div style="margin-bottom: 20px;">
         <a href="/instances" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">🤖 Bot Instances</a>
+        <a href="/competitions" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">📊 Competitions</a>
         <a href="/" style="color: #4ec9b0; text-decoration: none; font-weight: 600;">🗄️ Database Browser</a>
     </div>
     """
@@ -1602,6 +1604,874 @@ def api_remove_permission(guild_id):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+async def get_competition_progress_data_async(
+    competition_id: int,
+    view_type: str = 'individual',
+    team_id: Optional[int] = None,
+    player_ids: Optional[List[int]] = None
+) -> Dict[str, Any]:
+    """Get competition progress data for graphing.
+    
+    Args:
+        competition_id: Competition ID
+        view_type: 'individual' or 'team'
+        team_id: Optional team ID to filter
+        player_ids: Optional list of player IDs to filter
+    
+    Returns:
+        Dict with chart data and table data
+    """
+    from database import TornDatabase
+    
+    db = TornDatabase(DB_PATH)
+    await db.connect()
+    try:
+        # Get competition info
+        comp = await db.get_competition(competition_id)
+        if not comp:
+            return {'error': 'Competition not found'}
+        
+        tracked_stat = comp['tracked_stat']
+        start_date = comp['start_date']
+        end_date = comp['end_date']
+        
+        # Get participants
+        participants = await db.get_competition_participants(competition_id)
+        
+        # Filter participants if needed
+        if team_id:
+            participants = [p for p in participants if p.get('team_id') == team_id]
+        if player_ids:
+            participants = [p for p in participants if p['player_id'] in player_ids]
+        
+        if not participants:
+            return {'error': 'No participants found'}
+        
+        # Get teams for team view
+        teams = await db.get_competition_teams(competition_id)
+        team_map = {t['id']: t['team_name'] for t in teams}
+        
+        # Get start stats for all participants
+        start_stats = {}
+        for participant in participants:
+            player_id = participant['player_id']
+            start_stat = await db.get_competition_start_stat(competition_id, player_id)
+            start_stats[player_id] = start_stat if start_stat is not None else 0.0
+        
+        # Get historical data from player_contributor_history
+        # For gym_e_spent, we need to sum multiple stats
+        if tracked_stat == "gym_e_spent":
+            gym_stats = ["gymstrength", "gymdefense", "gymspeed", "gymdexterity"]
+            stat_names = gym_stats
+        else:
+            stat_names = [tracked_stat]
+        
+        # Collect all timestamps and values
+        history_data = {}  # {player_id: [(timestamp, value), ...]}
+        
+        participant_ids = [p['player_id'] for p in participants]
+        if not participant_ids:
+            return {'error': 'No participants found'}
+        
+        # Build query with proper parameter binding
+        placeholders_p = ','.join('?' * len(participant_ids))
+        placeholders_s = ','.join('?' * len(stat_names))
+        params = participant_ids + stat_names + [start_date, end_date]
+        
+        async with db.connection.execute(f"""
+            SELECT player_id, timestamp, value
+            FROM player_contributor_history
+            WHERE player_id IN ({placeholders_p})
+            AND stat_name IN ({placeholders_s})
+            AND timestamp >= ? AND timestamp <= ?
+            ORDER BY player_id, timestamp ASC
+        """, params) as cursor:
+            rows = await cursor.fetchall()
+            
+            for row in rows:
+                player_id, timestamp, value = row
+                if player_id not in history_data:
+                    history_data[player_id] = []
+                history_data[player_id].append((timestamp, value))
+        
+        # Process data for gym_e_spent (sum multiple stats)
+        if tracked_stat == "gym_e_spent":
+            # Group by timestamp and sum values
+            processed_history = {}
+            for player_id, data_points in history_data.items():
+                # Group by timestamp
+                timestamp_values = {}
+                for timestamp, value in data_points:
+                    if timestamp not in timestamp_values:
+                        timestamp_values[timestamp] = 0.0
+                    timestamp_values[timestamp] += value
+                processed_history[player_id] = sorted(timestamp_values.items())
+            history_data = processed_history
+        
+        # Build chart data
+        if view_type == 'team':
+            # Aggregate by team
+            team_data = {}  # {team_id: {timestamp: total_progress}}
+            
+            for participant in participants:
+                player_id = participant['player_id']
+                team_id_p = participant.get('team_id')
+                start_stat = start_stats.get(player_id, 0.0)
+                
+                if team_id_p not in team_data:
+                    team_data[team_id_p] = {}
+                
+                # Get cumulative values over time
+                if player_id in history_data:
+                    cumulative = start_stat
+                    for timestamp, value in history_data[player_id]:
+                        cumulative = value  # Current value at this timestamp
+                        progress = cumulative - start_stat
+                        
+                        if timestamp not in team_data[team_id_p]:
+                            team_data[team_id_p][timestamp] = 0.0
+                        team_data[team_id_p][timestamp] += progress
+            
+            # Get all unique timestamps across all teams
+            all_timestamps = set()
+            for timestamps_dict in team_data.values():
+                all_timestamps.update(timestamps_dict.keys())
+            all_timestamps = sorted(all_timestamps)
+            
+            # Convert to chart format with aligned timestamps
+            chart_datasets = []
+            table_data = []
+            labels = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') for ts in all_timestamps] if all_timestamps else []
+            
+            for team_id_p in sorted(team_data.keys()):
+                team_name = team_map.get(team_id_p, f"Team {team_id_p}") if team_id_p else "No Team"
+                timestamps_dict = team_data[team_id_p]
+                
+                # Build values array aligned to all_timestamps
+                values = []
+                last_value = 0.0
+                for ts in all_timestamps:
+                    if ts in timestamps_dict:
+                        last_value = timestamps_dict[ts]
+                    values.append(last_value)
+                
+                if values:
+                    chart_datasets.append({
+                        'label': team_name,
+                        'data': values,
+                        'borderColor': f'hsl({hash(team_name) % 360}, 70%, 50%)',
+                        'backgroundColor': f'hsla({hash(team_name) % 360}, 70%, 50%, 0.1)',
+                        'fill': False
+                    })
+                    
+                    # Table data: latest value
+                    latest_value = values[-1] if values else 0.0
+                    table_data.append({
+                        'name': team_name,
+                        'latest_progress': latest_value,
+                        'data_points': len([v for v in values if v > 0])
+                    })
+            
+            return {
+                'competition': comp,
+                'view_type': 'team',
+                'labels': labels,
+                'datasets': chart_datasets,
+                'table_data': sorted(table_data, key=lambda x: x['latest_progress'], reverse=True)
+            }
+        
+        else:
+            # Individual view
+            # Get all unique timestamps across all players
+            all_timestamps = set()
+            for player_id in history_data:
+                all_timestamps.update([ts for ts, _ in history_data[player_id]])
+            all_timestamps = sorted(all_timestamps)
+            labels = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') for ts in all_timestamps] if all_timestamps else []
+            
+            chart_datasets = []
+            table_data = []
+            
+            for participant in participants:
+                player_id = participant['player_id']
+                player_name = participant.get('player_name') or f"Player {player_id}"
+                start_stat = start_stats.get(player_id, 0.0)
+                
+                if player_id in history_data:
+                    # Build a dict for quick lookup
+                    data_dict = {ts: val for ts, val in history_data[player_id]}
+                    
+                    # Build values array aligned to all_timestamps
+                    values = []
+                    last_value = start_stat
+                    for ts in all_timestamps:
+                        if ts in data_dict:
+                            last_value = data_dict[ts]
+                        # Progress = current - start
+                        progress = last_value - start_stat
+                        values.append(progress)
+                    
+                    if values:
+                        chart_datasets.append({
+                            'label': player_name,
+                            'data': values,
+                            'borderColor': f'hsl({hash(player_name) % 360}, 70%, 50%)',
+                            'backgroundColor': f'hsla({hash(player_name) % 360}, 70%, 50%, 0.1)',
+                            'fill': False
+                        })
+                        
+                        # Table data
+                        latest_value = values[-1] if values else 0.0
+                        team_name = team_map.get(participant.get('team_id'), 'No Team') if participant.get('team_id') else 'No Team'
+                        table_data.append({
+                            'name': player_name,
+                            'player_id': player_id,
+                            'team': team_name,
+                            'latest_progress': latest_value,
+                            'data_points': len([v for v in values if v != 0])
+                        })
+            
+            return {
+                'competition': comp,
+                'view_type': 'individual',
+                'labels': labels,
+                'datasets': chart_datasets,
+                'table_data': sorted(table_data, key=lambda x: x['latest_progress'], reverse=True)
+            }
+    
+    finally:
+        await db.close()
+
+
+def get_competition_progress_data_sync(
+    competition_id: int,
+    view_type: str = 'individual',
+    team_id: Optional[int] = None,
+    player_ids: Optional[List[int]] = None
+) -> Dict[str, Any]:
+    """Sync wrapper for get_competition_progress_data_async."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(
+            get_competition_progress_data_async(competition_id, view_type, team_id, player_ids)
+        )
+    finally:
+        loop.close()
+
+
+@app.route('/competitions/<int:competition_id>/progress')
+def competition_progress(competition_id: int):
+    """Competition progress graph page."""
+    view_type = request.args.get('view', 'individual')  # 'individual' or 'team'
+    team_id = request.args.get('team_id', type=int)
+    player_ids_str = request.args.get('player_ids', '')
+    player_ids = [int(pid) for pid in player_ids_str.split(',') if pid.strip()] if player_ids_str else None
+    
+    # Get competition data
+    progress_data = get_competition_progress_data_sync(competition_id, view_type, team_id, player_ids)
+    
+    if 'error' in progress_data:
+        return f"<h1>Error</h1><p>{progress_data['error']}</p>", 404
+    
+    comp = progress_data['competition']
+    
+    # Get teams and participants for filters
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        from database import TornDatabase
+        db = TornDatabase(DB_PATH)
+        loop.run_until_complete(db.connect())
+        try:
+            teams = loop.run_until_complete(db.get_competition_teams(competition_id))
+            participants = loop.run_until_complete(db.get_competition_participants(competition_id))
+        finally:
+            loop.run_until_complete(db.close())
+    finally:
+        loop.close()
+    
+    # Prepare variables to avoid backslashes in f-string expressions
+    individual_selected = 'selected' if view_type == 'individual' else ''
+    team_selected = 'selected' if view_type == 'team' else ''
+    
+    # Build team filter HTML
+    team_filter_html = ''
+    if teams and view_type == 'individual':
+        team_options = []
+        for t in teams:
+            team_selected_attr = 'selected' if team_id == t['id'] else ''
+            team_options.append(f'<option value="{t["id"]}" {team_selected_attr}>{t["team_name"]}</option>')
+        team_filter_html = f'''
+                        <div class="filter-item">
+                            <label for="team_id">Filter by Team:</label>
+                            <select id="team_id" name="team_id" onchange="this.form.submit()">
+                                <option value="">All Teams</option>
+                                {''.join(team_options)}
+                            </select>
+                        </div>
+                        '''
+    
+    # Build table header
+    if view_type == 'team':
+        table_header = '<th>Team</th>'
+    else:
+        table_header = '<th>Player</th><th>Player ID</th><th>Team</th>'
+    
+    # Build table rows
+    table_rows = []
+    for row in progress_data['table_data']:
+        if view_type == 'team':
+            row_cells = f'<td>{row["name"]}</td>'
+        else:
+            row_cells = f'<td>{row["name"]}</td><td>{row["player_id"]}</td><td>{row["team"]}</td>'
+        table_rows.append(f'''
+                            <tr>
+                                {row_cells}
+                                <td class="number">{row["latest_progress"]:,.2f}</td>
+                                <td class="number">{row["data_points"]}</td>
+                            </tr>
+                            ''')
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Competition Progress - {comp['name']}</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+        <style>
+            * {{
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }}
+            
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }}
+            
+            .container {{
+                max-width: 1600px;
+                margin: 0 auto;
+            }}
+            
+            h1 {{
+                color: #4ec9b0;
+                margin-bottom: 10px;
+            }}
+            
+            .subtitle {{
+                color: #858585;
+                margin-bottom: 30px;
+            }}
+            
+            .nav-links {{
+                margin-bottom: 20px;
+            }}
+            
+            .nav-links a {{
+                color: #4ec9b0;
+                text-decoration: none;
+                margin-right: 20px;
+            }}
+            
+            .nav-links a:hover {{
+                text-decoration: underline;
+            }}
+            
+            .filters {{
+                background: #252526;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border: 1px solid #3e3e42;
+            }}
+            
+            .filter-group {{
+                display: flex;
+                gap: 15px;
+                flex-wrap: wrap;
+                align-items: flex-end;
+                margin-bottom: 15px;
+            }}
+            
+            .filter-item {{
+                flex: 1;
+                min-width: 200px;
+            }}
+            
+            label {{
+                display: block;
+                color: #cccccc;
+                margin-bottom: 5px;
+                font-size: 14px;
+            }}
+            
+            select, input {{
+                width: 100%;
+                padding: 8px 12px;
+                background: #1e1e1e;
+                border: 1px solid #3e3e42;
+                border-radius: 4px;
+                color: #d4d4d4;
+                font-size: 14px;
+            }}
+            
+            select:focus, input:focus {{
+                outline: none;
+                border-color: #007acc;
+            }}
+            
+            button {{
+                padding: 10px 20px;
+                background: #007acc;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                transition: background 0.2s;
+            }}
+            
+            button:hover {{
+                background: #005a9e;
+            }}
+            
+            .chart-container {{
+                background: #252526;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border: 1px solid #3e3e42;
+            }}
+            
+            .chart-wrapper {{
+                position: relative;
+                height: 500px;
+            }}
+            
+            .table-container {{
+                background: #252526;
+                border-radius: 8px;
+                border: 1px solid #3e3e42;
+                overflow-x: auto;
+            }}
+            
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }}
+            
+            thead {{
+                background: #2d2d30;
+                position: sticky;
+                top: 0;
+            }}
+            
+            th {{
+                padding: 12px;
+                text-align: left;
+                color: #4ec9b0;
+                font-weight: 600;
+                border-bottom: 2px solid #3e3e42;
+            }}
+            
+            td {{
+                padding: 10px 12px;
+                border-bottom: 1px solid #3e3e42;
+            }}
+            
+            tr:hover {{
+                background: #2d2d30;
+            }}
+            
+            .number {{
+                text-align: right;
+                color: #b5cea8;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📈 Competition Progress: {comp['name']}</h1>
+            <p class="subtitle">Tracked Stat: {comp['tracked_stat']}</p>
+            
+            <div class="nav-links">
+                <a href="/">Database Browser</a>
+                <a href="/instances">Instances</a>
+                <a href="/competitions">← Back to Competitions</a>
+            </div>
+            
+            <div class="filters">
+                <form method="GET" action="">
+                    <div class="filter-group">
+                        <div class="filter-item">
+                            <label for="view">View Type:</label>
+                            <select id="view" name="view" onchange="this.form.submit()">
+                                <option value="individual" {individual_selected}>Individual</option>
+                                <option value="team" {team_selected}>Team</option>
+                            </select>
+                        </div>
+                        {team_filter_html}
+                        <div class="filter-item">
+                            <button type="submit">Apply Filters</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            
+            <div class="chart-container">
+                <div class="chart-wrapper">
+                    <canvas id="progressChart"></canvas>
+                </div>
+            </div>
+            
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            {table_header}
+                            <th class="number">Latest Progress</th>
+                            <th class="number">Data Points</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {''.join(table_rows)}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <script>
+            const ctx = document.getElementById('progressChart').getContext('2d');
+            const chartData = {json.dumps({
+                'labels': progress_data['labels'],
+                'datasets': progress_data['datasets']
+            })};
+            
+            new Chart(ctx, {{
+                type: 'line',
+                data: chartData,
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            display: true,
+                            position: 'top',
+                            labels: {{
+                                color: '#d4d4d4',
+                                font: {{
+                                    size: 12
+                                }}
+                            }}
+                        }},
+                        title: {{
+                            display: true,
+                            text: 'Competition Progress Over Time',
+                            color: '#4ec9b0',
+                            font: {{
+                                size: 16,
+                                weight: 'bold'
+                            }}
+                        }},
+                        tooltip: {{
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#252526',
+                            titleColor: '#4ec9b0',
+                            bodyColor: '#d4d4d4',
+                            borderColor: '#3e3e42',
+                            borderWidth: 1
+                        }}
+                    }},
+                    scales: {{
+                        x: {{
+                            ticks: {{
+                                color: '#858585',
+                                maxRotation: 45,
+                                minRotation: 45
+                            }},
+                            grid: {{
+                                color: '#3e3e42'
+                            }}
+                        }},
+                        y: {{
+                            ticks: {{
+                                color: '#858585'
+                            }},
+                            grid: {{
+                                color: '#3e3e42'
+                            }},
+                            title: {{
+                                display: true,
+                                text: 'Progress ({comp["tracked_stat"]})',
+                                color: '#858585'
+                            }}
+                        }}
+                    }},
+                    interaction: {{
+                        mode: 'nearest',
+                        axis: 'x',
+                        intersect: false
+                    }}
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html)
+
+
+@app.route('/competitions')
+def competitions_list():
+    """List all competitions."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        from database import TornDatabase
+        db = TornDatabase(DB_PATH)
+        loop.run_until_complete(db.connect())
+        try:
+            competitions = loop.run_until_complete(db.list_competitions())
+        finally:
+            loop.run_until_complete(db.close())
+    finally:
+        loop.close()
+    
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Competitions</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }
+            
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+            }
+            
+            h1 {
+                color: #4ec9b0;
+                margin-bottom: 10px;
+            }
+            
+            .subtitle {
+                color: #858585;
+                margin-bottom: 30px;
+            }
+            
+            .nav-links {
+                margin-bottom: 20px;
+            }
+            
+            .nav-links a {
+                color: #4ec9b0;
+                text-decoration: none;
+                margin-right: 20px;
+            }
+            
+            .nav-links a:hover {
+                text-decoration: underline;
+            }
+            
+            .competition-card {
+                background: #252526;
+                border: 1px solid #3e3e42;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+                transition: border-color 0.2s;
+            }
+            
+            .competition-card:hover {
+                border-color: #007acc;
+            }
+            
+            .competition-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: start;
+                margin-bottom: 15px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            
+            .competition-title {
+                font-size: 1.3em;
+                font-weight: 600;
+                color: #4ec9b0;
+            }
+            
+            .status-badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 0.85em;
+                font-weight: 600;
+                text-transform: uppercase;
+            }
+            
+            .status-active { background: #1e3a1e; color: #4ec9b0; }
+            .status-cancelled { background: #3a1e1e; color: #f48771; }
+            .status-completed { background: #3a3a1e; color: #dcdcaa; }
+            
+            .competition-info {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 15px;
+            }
+            
+            .info-item {
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .info-label {
+                font-size: 0.85em;
+                color: #858585;
+                margin-bottom: 4px;
+            }
+            
+            .info-value {
+                color: #d4d4d4;
+                font-weight: 500;
+            }
+            
+            .btn {
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                text-decoration: none;
+                display: inline-block;
+                transition: background 0.2s;
+                background: #007acc;
+                color: white;
+            }
+            
+            .btn:hover {
+                background: #005a9e;
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 60px 20px;
+                color: #858585;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📊 Competitions</h1>
+            <p class="subtitle">View and track competition progress</p>
+            
+            <div class="nav-links">
+                <a href="/">Database Browser</a>
+                <a href="/instances">Instances</a>
+                <a href="/competitions">Competitions</a>
+            </div>
+    """
+    
+    if not competitions:
+        html += """
+            <div class="empty-state">
+                <h2>No Competitions Found</h2>
+                <p>No competitions have been created yet.</p>
+            </div>
+        """
+    else:
+        for comp in competitions:
+            status = comp.get('status', 'active')
+            status_class = f'status-{status}'
+            start_date_str = datetime.fromtimestamp(comp['start_date']).strftime('%Y-%m-%d') if comp.get('start_date') else 'N/A'
+            end_date_str = datetime.fromtimestamp(comp['end_date']).strftime('%Y-%m-%d') if comp.get('end_date') else 'N/A'
+            
+            html += f"""
+            <div class="competition-card">
+                <div class="competition-header">
+                    <div>
+                        <div class="competition-title">{comp['name']}</div>
+                        <div style="color: #858585; font-size: 0.9em; margin-top: 4px;">ID: {comp['id']}</div>
+                    </div>
+                    <span class="status-badge {status_class}">{status}</span>
+                </div>
+                
+                <div class="competition-info">
+                    <div class="info-item">
+                        <span class="info-label">Tracked Stat</span>
+                        <span class="info-value">{comp['tracked_stat']}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Start Date</span>
+                        <span class="info-value">{start_date_str}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">End Date</span>
+                        <span class="info-value">{end_date_str}</span>
+                    </div>
+                </div>
+                
+                <a href="/competitions/{comp['id']}/progress" class="btn">View Progress Graph</a>
+            </div>
+            """
+    
+    html += """
+        </div>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html)
+
+
+@app.route('/api/competitions')
+def api_competitions():
+    """API endpoint to get list of competitions."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        from database import TornDatabase
+        db = TornDatabase(DB_PATH)
+        loop.run_until_complete(db.connect())
+        try:
+            competitions = loop.run_until_complete(db.list_competitions())
+        finally:
+            loop.run_until_complete(db.close())
+    finally:
+        loop.close()
+    
+    return jsonify({'competitions': competitions})
 
 
 if __name__ == '__main__':
