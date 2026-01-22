@@ -1107,6 +1107,318 @@ def setup(bot: commands.Bot):
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
             import traceback
             traceback.print_exc()
+    
+    @bot.tree.command(name="competition-progress", description="Show competition progress graph (visible to channel)")
+    @discord.app_commands.describe(
+        competition_id="ID of the competition",
+        view_type="View type: individual or team (default: team)",
+        limit="Number of top entries to show (default: 10)"
+    )
+    async def competition_progress(
+        interaction: discord.Interaction,
+        competition_id: int,
+        view_type: Optional[str] = "team",
+        limit: Optional[int] = 10
+    ):
+        """Show competition progress as a visual graph in Discord embed."""
+        await interaction.response.defer(ephemeral=False)  # Visible to channel
+        
+        if not await check_database_available(bot, interaction):
+            return
+        
+        try:
+            comp = await validate_competition_exists(bot, competition_id, interaction)
+            if not comp:
+                return
+            
+            view_type = view_type.lower() if view_type else "team"
+            if view_type not in ["individual", "team"]:
+                await interaction.followup.send("❌ View type must be 'individual' or 'team'.", ephemeral=True)
+                return
+            
+            # Get progress data
+            progress_data = await _get_competition_progress_data(
+                bot, competition_id, view_type
+            )
+            
+            if 'error' in progress_data:
+                await interaction.followup.send(f"❌ {progress_data['error']}", ephemeral=True)
+                return
+            
+            # Build embed
+            status_emoji = get_status_emoji(comp["status"])
+            embed = discord.Embed(
+                title=f"{status_emoji} Competition Progress: {comp['name']}",
+                color=discord.Color.blue(),
+                description=f"**Tracked Stat:** `{comp['tracked_stat']}`\n**View:** {view_type.title()}"
+            )
+            
+            # Add competition period
+            start_date_str = datetime.fromtimestamp(comp["start_date"]).strftime("%Y-%m-%d")
+            end_date_str = datetime.fromtimestamp(comp["end_date"]).strftime("%Y-%m-%d")
+            embed.add_field(name="Period", value=f"{start_date_str} to {end_date_str}", inline=False)
+            
+            # Get top entries
+            table_data = progress_data.get('table_data', [])
+            if not table_data:
+                embed.add_field(
+                    name="No Data",
+                    value="No progress data available yet. Stats will appear after the first update.",
+                    inline=False
+                )
+                await interaction.followup.send(embed=embed)
+                return
+            
+            # Limit entries
+            display_data = table_data[:limit] if limit else table_data
+            
+            # Create progress visualization
+            if view_type == "team":
+                # Team view - show progress bars
+                progress_text = _create_progress_bars(display_data, "team")
+                # Discord field value limit is 1024 characters
+                if len(progress_text) > 1024:
+                    progress_text = progress_text[:1021] + "..."
+                embed.add_field(
+                    name=f"🏆 Top {len(display_data)} Teams",
+                    value=progress_text,
+                    inline=False
+                )
+            else:
+                # Individual view - show progress bars
+                progress_text = _create_progress_bars(display_data, "individual")
+                # Discord field value limit is 1024 characters
+                if len(progress_text) > 1024:
+                    progress_text = progress_text[:1021] + "..."
+                embed.add_field(
+                    name=f"👤 Top {len(display_data)} Participants",
+                    value=progress_text,
+                    inline=False
+                )
+            
+            # Add summary stats
+            if table_data:
+                max_progress = max(row['latest_progress'] for row in table_data)
+                min_progress = min(row['latest_progress'] for row in table_data)
+                avg_progress = sum(row['latest_progress'] for row in table_data) / len(table_data)
+                
+                embed.add_field(
+                    name="📊 Statistics",
+                    value=(
+                        f"**Max:** {format_number_with_sign(max_progress)}\n"
+                        f"**Min:** {format_number_with_sign(min_progress)}\n"
+                        f"**Avg:** {format_number_with_sign(avg_progress)}\n"
+                        f"**Total Entries:** {len(table_data)}"
+                    ),
+                    inline=True
+                )
+            
+            # Add note about data points
+            total_data_points = sum(row.get('data_points', 0) for row in table_data)
+            if total_data_points > 0:
+                embed.set_footer(text=f"Total data points: {total_data_points} | Use /competition-update-stats to refresh")
+            
+            await interaction.followup.send(embed=embed)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+            import traceback
+            traceback.print_exc()
+
+
+async def _get_competition_progress_data(
+    bot: commands.Bot,
+    competition_id: int,
+    view_type: str = 'team'
+) -> Dict[str, Any]:
+    """Get competition progress data for Discord display.
+    
+    Similar to web app but simplified for Discord embeds.
+    """
+    comp = await bot.database.get_competition(competition_id)
+    if not comp:
+        return {'error': 'Competition not found'}
+    
+    tracked_stat = comp['tracked_stat']
+    start_date = comp['start_date']
+    end_date = comp['end_date']
+    
+    # Get participants
+    participants = await bot.database.get_competition_participants(competition_id)
+    if not participants:
+        return {'error': 'No participants found'}
+    
+    # Get teams
+    teams = await bot.database.get_competition_teams(competition_id)
+    team_map = {t['id']: t['team_name'] for t in teams}
+    
+    # Get start stats
+    start_stats = {}
+    for participant in participants:
+        player_id = participant['player_id']
+        start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
+        start_stats[player_id] = start_stat if start_stat is not None else 0.0
+    
+    # Get historical data
+    if tracked_stat == "gym_e_spent":
+        stat_names = ["gymstrength", "gymdefense", "gymspeed", "gymdexterity"]
+    else:
+        stat_names = [tracked_stat]
+    
+    # Get latest values from history
+    participant_ids = [p['player_id'] for p in participants]
+    history_data = {}
+    
+    for player_id in participant_ids:
+        for stat_name in stat_names:
+            # Get latest value from contributor history
+            async with bot.database.connection.execute("""
+                SELECT value FROM player_contributor_history
+                WHERE player_id = ? AND stat_name = ?
+                AND timestamp >= ? AND timestamp <= ?
+                ORDER BY timestamp DESC LIMIT 1
+            """, (player_id, stat_name, start_date, end_date)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    if player_id not in history_data:
+                        history_data[player_id] = {}
+                    if stat_name not in history_data[player_id]:
+                        history_data[player_id][stat_name] = 0.0
+                    history_data[player_id][stat_name] += row[0]
+    
+    # Process data
+    table_data = []
+    
+    if view_type == 'team':
+        # Aggregate by team
+        team_data = {}
+        for participant in participants:
+            player_id = participant['player_id']
+            team_id_p = participant.get('team_id')
+            start_stat = start_stats.get(player_id, 0.0)
+            
+            # Get current value
+            current_value = 0.0
+            if player_id in history_data:
+                if tracked_stat == "gym_e_spent":
+                    current_value = sum(history_data[player_id].values())
+                else:
+                    current_value = history_data[player_id].get(tracked_stat, start_stat)
+            else:
+                # Fallback to current stat value
+                current_stat = await bot.database.get_player_current_stat_value(
+                    player_id, tracked_stat
+                )
+                if current_stat is not None:
+                    current_value = current_stat
+            
+            progress = current_value - start_stat
+            
+            if team_id_p not in team_data:
+                team_data[team_id_p] = {
+                    'name': team_map.get(team_id_p, f"Team {team_id_p}") if team_id_p else "No Team",
+                    'progress': 0.0,
+                    'count': 0
+                }
+            team_data[team_id_p]['progress'] += progress
+            team_data[team_id_p]['count'] += 1
+        
+        for team_id_p, data in team_data.items():
+            table_data.append({
+                'name': data['name'],
+                'latest_progress': data['progress'],
+                'data_points': data['count']
+            })
+    else:
+        # Individual view
+        for participant in participants:
+            player_id = participant['player_id']
+            player_name = participant.get('player_name') or f"Player {player_id}"
+            start_stat = start_stats.get(player_id, 0.0)
+            
+            # Get current value
+            current_value = 0.0
+            if player_id in history_data:
+                if tracked_stat == "gym_e_spent":
+                    current_value = sum(history_data[player_id].values())
+                else:
+                    current_value = history_data[player_id].get(tracked_stat, start_stat)
+            else:
+                # Fallback to current stat value
+                current_stat = await bot.database.get_player_current_stat_value(
+                    player_id, tracked_stat
+                )
+                if current_stat is not None:
+                    current_value = current_stat
+            
+            progress = current_value - start_stat
+            team_name = team_map.get(participant.get('team_id'), 'No Team') if participant.get('team_id') else 'No Team'
+            
+            table_data.append({
+                'name': player_name,
+                'player_id': player_id,
+                'team': team_name,
+                'latest_progress': progress,
+                'data_points': 1
+            })
+    
+    # Sort by progress
+    table_data.sort(key=lambda x: x['latest_progress'], reverse=True)
+    
+    return {
+        'competition': comp,
+        'view_type': view_type,
+        'table_data': table_data
+    }
+
+
+def _create_progress_bars(data: List[Dict[str, Any]], view_type: str) -> str:
+    """Create text-based progress bars for Discord embed."""
+    if not data:
+        return "No data available"
+    
+    # Find max absolute value for scaling
+    max_abs = max(abs(row['latest_progress']) for row in data)
+    if max_abs == 0:
+        max_abs = 1  # Avoid division by zero
+    
+    lines = []
+    bar_length = 20  # Characters for progress bar
+    
+    for i, row in enumerate(data, 1):
+        progress = row['latest_progress']
+        name = row['name']
+        
+        # Truncate long names
+        if len(name) > 25:
+            name = name[:22] + "..."
+        
+        # Calculate bar fill
+        fill_ratio = abs(progress) / max_abs
+        fill_length = int(fill_ratio * bar_length)
+        bar_fill = "█" * fill_length
+        bar_empty = "░" * (bar_length - fill_length)
+        
+        # Choose emoji based on sign
+        if progress >= 0:
+            emoji = "📈"
+            bar = bar_fill + bar_empty
+        else:
+            emoji = "📉"
+            bar = bar_empty + bar_fill
+        
+        # Format value
+        value_str = format_number_with_sign(progress)
+        
+        # Add team info for individual view
+        if view_type == "individual" and 'team' in row:
+            team_info = f" [{row['team']}]"
+        else:
+            team_info = ""
+        
+        lines.append(f"{i}. {emoji} **{name}**{team_info}\n`{bar}` {value_str}")
+    
+    return "\n\n".join(lines)
 
 
 async def _process_faction_contributors_data(
