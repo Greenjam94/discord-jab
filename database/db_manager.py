@@ -46,6 +46,11 @@ class TornDatabase:
             await self.connection.close()
             self.connection = None
     
+    async def _ensure_connected(self):
+        """Ensure database connection is established."""
+        if self.connection is None:
+            await self.connect()
+    
     async def _initialize_schema(self):
         """Create database schema if it doesn't exist."""
         current_version = await self._get_schema_version()
@@ -1293,6 +1298,10 @@ class TornDatabase:
         Args:
             guild_ids: Optional list of guild IDs to update. If None, updates all active guilds.
         """
+        # Ensure connection is established
+        if self.connection is None:
+            return  # Silently skip if connection not available
+        
         import time
         current_time = int(time.time())
         
@@ -1320,6 +1329,9 @@ class TornDatabase:
     
     async def get_command_permissions(self, guild_id: str) -> Dict[str, List[Dict[str, str]]]:
         """Get all command permissions for a guild, organized by command."""
+        # Ensure connection is established
+        await self._ensure_connected()
+        
         permissions = {}
         async with self.connection.execute("""
             SELECT command_name, permission_type, permission_value

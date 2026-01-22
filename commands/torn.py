@@ -36,9 +36,19 @@ def setup(bot: commands.Bot):
             return
         
         # Legacy check: if no DB permissions set, fall back to Discord permissions
-        if db:
-            perms = await db.get_command_permissions(str(interaction.guild.id))
-            if not perms.get("torn-key-add"):  # No custom permissions set, use Discord default
+        if db and db.connection is not None:
+            try:
+                perms = await db.get_command_permissions(str(interaction.guild.id))
+                if not perms.get("torn-key-add"):  # No custom permissions set, use Discord default
+                    if not interaction.user.guild_permissions.administrator:
+                        await interaction.response.send_message(
+                            "❌ You need administrator permissions to add API keys.",
+                            ephemeral=True
+                        )
+                        return
+            except Exception as e:
+                # If database query fails, fall back to Discord permissions
+                print(f"⚠️  Error checking permissions: {e}")
                 if not interaction.user.guild_permissions.administrator:
                     await interaction.response.send_message(
                         "❌ You need administrator permissions to add API keys.",
