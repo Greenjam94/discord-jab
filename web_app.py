@@ -556,7 +556,9 @@ async def query_table_async(
         'war_status_history', 'territory_ownership_history',
         'player_stats_summary', 'faction_summary', 'war_summary',
         'territory_ownership_summary', 'competitions', 'competition_participants',
-        'competition_teams', 'competition_start_stats', 'competition_stats'
+        'competition_teams', 'competition_start_stats', 'competition_stats',
+        'organized_crimes_current', 'organized_crimes_history', 'organized_crimes_config',
+        'organized_crimes_participant_stats'
     }
     
     if table_name not in allowed_tables:
@@ -632,6 +634,7 @@ def index():
     <div style="margin-bottom: 20px;">
         <a href="/instances" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">🤖 Bot Instances</a>
         <a href="/competitions" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">📊 Competitions</a>
+        <a href="/organized-crimes" style="color: #4ec9b0; text-decoration: none; margin-right: 20px; font-weight: 600;">🔫 Organized Crimes</a>
         <a href="/" style="color: #4ec9b0; text-decoration: none; font-weight: 600;">🗄️ Database Browser</a>
     </div>
     """
@@ -2472,6 +2475,392 @@ def api_competitions():
         loop.close()
     
     return jsonify({'competitions': competitions})
+
+
+async def _get_organized_crimes_config_async():
+    """Async helper to get organized crime config data."""
+    from database import TornDatabase
+    db = TornDatabase(DB_PATH)
+    await db.connect()
+    try:
+        configs = await db.get_all_tracked_factions()
+        # Get all factions for dropdown
+        async with db.connection.execute("""
+            SELECT faction_id, name FROM factions ORDER BY faction_id
+        """) as cursor:
+            all_factions = await cursor.fetchall()
+        return configs, all_factions
+    finally:
+        await db.close()
+
+
+@app.route('/organized-crimes')
+def organized_crimes_config():
+    """Organized crime configuration page."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        configs, all_factions = loop.run_until_complete(_get_organized_crimes_config_async())
+    finally:
+        loop.close()
+    
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Organized Crime Configuration</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }
+            
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+            
+            h1 {
+                color: #4ec9b0;
+                margin-bottom: 10px;
+            }
+            
+            .subtitle {
+                color: #858585;
+                margin-bottom: 30px;
+            }
+            
+            .nav-links {
+                margin-bottom: 20px;
+            }
+            
+            .nav-links a {
+                color: #4ec9b0;
+                text-decoration: none;
+                margin-right: 20px;
+            }
+            
+            .nav-links a:hover {
+                text-decoration: underline;
+            }
+            
+            .config-card {
+                background: #252526;
+                border: 1px solid #3e3e42;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+            }
+            
+            .config-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: start;
+                margin-bottom: 15px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            
+            .config-title {
+                font-size: 1.3em;
+                font-weight: 600;
+                color: #4ec9b0;
+            }
+            
+            .config-form {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 15px;
+                margin-bottom: 15px;
+            }
+            
+            .form-group {
+                display: flex;
+                flex-direction: column;
+            }
+            
+            label {
+                color: #cccccc;
+                margin-bottom: 5px;
+                font-size: 14px;
+            }
+            
+            input, select, textarea {
+                padding: 8px 12px;
+                background: #1e1e1e;
+                border: 1px solid #3e3e42;
+                border-radius: 4px;
+                color: #d4d4d4;
+                font-size: 14px;
+            }
+            
+            input:focus, select:focus, textarea:focus {
+                outline: none;
+                border-color: #007acc;
+            }
+            
+            .btn {
+                padding: 8px 16px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                transition: background 0.2s;
+            }
+            
+            .btn-primary {
+                background: #007acc;
+                color: white;
+            }
+            
+            .btn-primary:hover {
+                background: #005a9e;
+            }
+            
+            .btn-danger {
+                background: #be1100;
+                color: white;
+            }
+            
+            .btn-danger:hover {
+                background: #8b0d00;
+            }
+            
+            .status-badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 12px;
+                font-size: 0.85em;
+                font-weight: 600;
+            }
+            
+            .status-enabled { background: #1e3a1e; color: #4ec9b0; }
+            .status-disabled { background: #3a1e1e; color: #f48771; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔫 Organized Crime Configuration</h1>
+            <p class="subtitle">Configure organized crime tracking for factions</p>
+            
+            <div class="nav-links">
+                <a href="/">Database Browser</a>
+                <a href="/instances">Instances</a>
+                <a href="/competitions">Competitions</a>
+                <a href="/organized-crimes">Organized Crimes</a>
+            </div>
+            
+            <div class="config-card">
+                <h2 style="color: #4ec9b0; margin-bottom: 15px;">Add/Edit Configuration</h2>
+                <form id="configForm" onsubmit="saveConfig(event)">
+                    <div class="config-form">
+                        <div class="form-group">
+                            <label for="faction_id">Faction ID:</label>
+                            <input type="number" id="faction_id" name="faction_id" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="guild_id">Discord Guild ID:</label>
+                            <input type="text" id="guild_id" name="guild_id" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="enabled">Enabled:</label>
+                            <select id="enabled" name="enabled">
+                                <option value="1">Yes</option>
+                                <option value="0">No</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="notification_channel_id">Notification Channel ID (Frequent Leavers):</label>
+                            <input type="text" id="notification_channel_id" name="notification_channel_id" placeholder="Discord channel ID">
+                        </div>
+                        <div class="form-group">
+                            <label for="missing_item_reminder_channel_id">Missing Item Reminder Channel ID:</label>
+                            <input type="text" id="missing_item_reminder_channel_id" name="missing_item_reminder_channel_id" placeholder="Discord channel ID">
+                        </div>
+                        <div class="form-group">
+                            <label for="frequent_leaver_threshold">Frequent Leaver Threshold:</label>
+                            <input type="number" id="frequent_leaver_threshold" name="frequent_leaver_threshold" value="2" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="tracking_window_days">Tracking Window (days):</label>
+                            <input type="number" id="tracking_window_days" name="tracking_window_days" value="30" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="faction_lead_discord_ids">Faction Lead Discord IDs (comma-separated):</label>
+                            <input type="text" id="faction_lead_discord_ids" name="faction_lead_discord_ids" placeholder="123456789,987654321">
+                        </div>
+                        <div class="form-group">
+                            <label for="auto_sync_enabled">Auto Sync Enabled:</label>
+                            <select id="auto_sync_enabled" name="auto_sync_enabled">
+                                <option value="1">Yes</option>
+                                <option value="0">No</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Save Configuration</button>
+                </form>
+            </div>
+    """
+    
+    if configs:
+        html += """
+            <h2 style="color: #4ec9b0; margin-top: 30px; margin-bottom: 15px;">Current Configurations</h2>
+        """
+        
+        for config in configs:
+            status_class = "status-enabled" if config['enabled'] else "status-disabled"
+            status_text = "Enabled" if config['enabled'] else "Disabled"
+            lead_ids_str = ", ".join(config.get('faction_lead_discord_ids', []))
+            
+            html += f"""
+            <div class="config-card">
+                <div class="config-header">
+                    <div>
+                        <div class="config-title">Faction {config['faction_id']} - Guild {config['guild_id']}</div>
+                    </div>
+                    <span class="status-badge {status_class}">{status_text}</span>
+                </div>
+                <div class="config-form">
+                    <div class="form-group">
+                        <label>Notification Channel (Frequent Leavers):</label>
+                        <div>{config.get('notification_channel_id', 'Not set')}</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Missing Item Reminder Channel:</label>
+                        <div>{config.get('missing_item_reminder_channel_id', 'Not set')}</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Frequent Leaver Threshold:</label>
+                        <div>{config['frequent_leaver_threshold']}</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Tracking Window:</label>
+                        <div>{config['tracking_window_days']} days</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Faction Leads:</label>
+                        <div>{lead_ids_str if lead_ids_str else 'Not set'}</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Auto Sync:</label>
+                        <div>{'Yes' if config['auto_sync_enabled'] else 'No'}</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Last Sync:</label>
+                        <div>{datetime.fromtimestamp(config['last_sync']).strftime('%Y-%m-%d %H:%M:%S') if config.get('last_sync') else 'Never'}</div>
+                    </div>
+                </div>
+            </div>
+            """
+    else:
+        html += """
+            <div class="config-card">
+                <p style="color: #858585; text-align: center; padding: 40px;">No configurations found. Add one above to get started.</p>
+            </div>
+        """
+    
+    html += """
+        </div>
+        
+        <script>
+            function saveConfig(event) {
+                event.preventDefault();
+                
+                const form = event.target;
+                const formData = new FormData(form);
+                const data = {};
+                
+                for (let [key, value] of formData.entries()) {
+                    if (key === 'faction_lead_discord_ids') {
+                        // Split comma-separated IDs and filter empty
+                        data[key] = value.split(',').map(id => id.trim()).filter(id => id);
+                    } else if (key === 'enabled' || key === 'auto_sync_enabled') {
+                        data[key] = value === '1';
+                    } else if (key === 'frequent_leaver_threshold' || key === 'tracking_window_days' || key === 'faction_id') {
+                        data[key] = parseInt(value);
+                    } else {
+                        data[key] = value || null;
+                    }
+                }
+                
+                fetch('/api/organized-crimes/config', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    } else {
+                        alert('Configuration saved successfully!');
+                        location.reload();
+                    }
+                })
+                .catch(error => {
+                    alert('Error: ' + error);
+                });
+            }
+        </script>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(html)
+
+
+@app.route('/api/organized-crimes/config', methods=['POST'])
+def api_organized_crimes_config():
+    """API endpoint to save organized crime configuration."""
+    try:
+        data = request.get_json()
+        faction_id = data.get('faction_id')
+        guild_id = data.get('guild_id')
+        
+        if not faction_id or not guild_id:
+            return jsonify({'error': 'faction_id and guild_id are required'}), 400
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from database import TornDatabase
+            db = TornDatabase(DB_PATH)
+            loop.run_until_complete(db.connect())
+            
+            try:
+                loop.run_until_complete(db.upsert_organized_crime_config(
+                    faction_id=faction_id,
+                    guild_id=str(guild_id),
+                    enabled=data.get('enabled'),
+                    notification_channel_id=data.get('notification_channel_id'),
+                    frequent_leaver_threshold=data.get('frequent_leaver_threshold'),
+                    tracking_window_days=data.get('tracking_window_days'),
+                    faction_lead_discord_ids=data.get('faction_lead_discord_ids'),
+                    auto_sync_enabled=data.get('auto_sync_enabled'),
+                    missing_item_reminder_channel_id=data.get('missing_item_reminder_channel_id')
+                ))
+            finally:
+                loop.run_until_complete(db.close())
+        finally:
+            loop.close()
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':

@@ -326,6 +326,33 @@ async def before_update_instances_task():
     await bot.wait_until_ready()
     await asyncio.sleep(60)  # Wait 1 minute after ready
 
+@tasks.loop(minutes=10)  # Every 10 minutes
+async def sync_organized_crimes_task():
+    """Background task to sync organized crime data every 10 minutes."""
+    if not hasattr(bot, 'database') or not bot.database:
+        return
+    
+    print('🔄 Starting organized crime sync...')
+    
+    try:
+        from commands.organized_crimes import sync_organized_crimes_helper
+        result = await sync_organized_crimes_helper(bot)
+        
+        if result.get("error"):
+            print(f'❌ Organized crime sync error: {result.get("error")}')
+        else:
+            print(f'✅ Organized crime sync completed: {result.get("message")}')
+    except Exception as e:
+        print(f'❌ Organized crime sync error: {e}')
+        import traceback
+        traceback.print_exc()
+
+@sync_organized_crimes_task.before_loop
+async def before_sync_oc_task():
+    """Wait until bot is ready before starting the task."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)  # Wait 1 minute after ready
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has logged in!')
@@ -348,12 +375,13 @@ async def on_ready():
     
     # Load command modules
     try:
-        from commands import admin, games, torn, competitions
+        from commands import admin, games, torn, competitions, organized_crimes
         admin.setup(bot)
         games.setup(bot)
         torn.setup(bot)
         competitions.setup(bot)
-        print('Loaded command modules: admin, games, torn, competitions')
+        organized_crimes.setup(bot)
+        print('Loaded command modules: admin, games, torn, competitions, organized_crimes')
     except Exception as e:
         print(f'Failed to load command modules: {e}')
     
@@ -414,6 +442,10 @@ async def on_ready():
         # Start bot instances update task
         update_bot_instances_task.start()
         print('✅ Bot instances update task started')
+        
+        # Start organized crime sync task
+        sync_organized_crimes_task.start()
+        print('✅ Organized crime sync task started')
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):

@@ -12,7 +12,7 @@ import json
 class TornDatabase:
     """Manages SQLite database for Torn API data."""
     
-    CURRENT_SCHEMA_VERSION = 4
+    CURRENT_SCHEMA_VERSION = 6
     
     def __init__(self, db_path: str = "data/torn_data.db"):
         """Initialize database manager.
@@ -70,6 +70,26 @@ class TornDatabase:
         if current_version < 4:
             await self._create_schema_v4()
             await self._set_schema_version(4, "Added bot instances and command permissions tables")
+        
+        if current_version < 5:
+            # Check if tables already exist (in case migration was partially applied)
+            tables_exist = (
+                await self._check_table_exists("organized_crimes_current") and
+                await self._check_table_exists("organized_crimes_history") and
+                await self._check_table_exists("organized_crimes_config") and
+                await self._check_table_exists("organized_crimes_participant_stats")
+            )
+            
+            if not tables_exist:
+                await self._create_schema_v5()
+                await self._set_schema_version(5, "Added organized crime tracking tables")
+            else:
+                # Tables exist but version wasn't set - just set the version
+                await self._set_schema_version(5, "Added organized crime tracking tables")
+        
+        if current_version < 6:
+            await self._create_schema_v6()
+            await self._set_schema_version(6, "Added missing item reminders, items cache, and discord_id to players")
     
     async def _get_schema_version(self) -> int:
         """Get current schema version."""
@@ -88,6 +108,30 @@ class TornDatabase:
             "INSERT INTO schema_version (version, description) VALUES (?, ?)",
             (version, description)
         )
+        await self.connection.commit()
+    
+    async def _check_table_exists(self, table_name: str) -> bool:
+        """Check if a table exists."""
+        try:
+            async with self.connection.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name=?
+            """, (table_name,)) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
+        except Exception:
+            return False
+    
+    async def reset_schema_version(self, target_version: int):
+        """Reset schema version by deleting versions greater than target.
+        
+        WARNING: This should only be used for development/testing.
+        It will cause migrations to re-run on next connection.
+        """
+        await self._ensure_connected()
+        await self.connection.execute("""
+            DELETE FROM schema_version WHERE version > ?
+        """, (target_version,))
         await self.connection.commit()
     
     async def _create_schema_v1(self):
@@ -1386,6 +1430,187 @@ class TornDatabase:
         """, (guild_id, command_name))
         await self.connection.commit()
     
+    async def _create_schema_v5(self):
+        """Create schema v5: Add organized crime tracking tables."""
+        # Current organized crimes table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS organized_crimes_current (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faction_id INTEGER NOT NULL,
+                crime_id INTEGER NOT NULL,
+                crime_name TEXT NOT NULL,
+                crime_type TEXT,
+                participants TEXT NOT NULL,
+                participant_count INTEGER NOT NULL,
+                required_participants INTEGER,
+                time_started INTEGER,
+                time_completed INTEGER,
+                status TEXT NOT NULL CHECK (status IN ('planning', 'ready', 'in_progress', 'completed', 'failed', 'cancelled')),
+                reward_money INTEGER,
+                reward_respect INTEGER,
+                reward_other TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_updated INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                data_source TEXT,
+                FOREIGN KEY (faction_id) REFERENCES factions(faction_id),
+                UNIQUE(faction_id, crime_id)
+            )
+        """)
+        
+        # Organized crimes history table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS organized_crimes_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faction_id INTEGER NOT NULL,
+                crime_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK (event_type IN ('created', 'participant_joined', 'participant_left', 'status_changed', 'completed', 'failed', 'cancelled')),
+                event_timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                player_id INTEGER,
+                old_status TEXT,
+                new_status TEXT,
+                old_participants TEXT,
+                new_participants TEXT,
+                reward_money INTEGER,
+                reward_respect INTEGER,
+                reward_other TEXT,
+                metadata TEXT,
+                data_source TEXT,
+                FOREIGN KEY (faction_id) REFERENCES factions(faction_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id)
+            )
+        """)
+        
+        # Organized crimes configuration table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS organized_crimes_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faction_id INTEGER NOT NULL,
+                guild_id TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                notification_channel_id TEXT,
+                frequent_leaver_threshold INTEGER NOT NULL DEFAULT 2,
+                tracking_window_days INTEGER NOT NULL DEFAULT 30,
+                faction_lead_discord_ids TEXT,
+                auto_sync_enabled BOOLEAN NOT NULL DEFAULT 1,
+                last_sync INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_updated INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (faction_id) REFERENCES factions(faction_id),
+                UNIQUE(faction_id, guild_id)
+            )
+        """)
+        
+        # Organized crimes participant stats table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS organized_crimes_participant_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faction_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                crime_type TEXT,
+                crimes_started INTEGER NOT NULL DEFAULT 0,
+                crimes_completed INTEGER NOT NULL DEFAULT 0,
+                crimes_failed INTEGER NOT NULL DEFAULT 0,
+                crimes_left INTEGER NOT NULL DEFAULT 0,
+                total_reward_money INTEGER NOT NULL DEFAULT 0,
+                total_reward_respect INTEGER NOT NULL DEFAULT 0,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                last_updated INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (faction_id) REFERENCES factions(faction_id),
+                FOREIGN KEY (player_id) REFERENCES players(player_id),
+                UNIQUE(faction_id, player_id, crime_type, period_start, period_end)
+            )
+        """)
+        
+        # Create indexes
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_current_faction 
+            ON organized_crimes_current(faction_id)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_current_status 
+            ON organized_crimes_current(status)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_history_faction_crime 
+            ON organized_crimes_history(faction_id, crime_id)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_history_player 
+            ON organized_crimes_history(player_id)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_history_event_type 
+            ON organized_crimes_history(event_type, event_timestamp)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_config_faction 
+            ON organized_crimes_config(faction_id)
+        """)
+        
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_oc_stats_faction_player 
+            ON organized_crimes_participant_stats(faction_id, player_id)
+        """)
+        
+        await self.connection.commit()
+    
+    async def _create_schema_v6(self):
+        """Create schema version 6: Add missing item reminders, items cache, and discord_id to players."""
+        # Add missing_item_reminder_channel_id to organized_crimes_config
+        try:
+            await self.connection.execute("""
+                ALTER TABLE organized_crimes_config
+                ADD COLUMN missing_item_reminder_channel_id TEXT
+            """)
+        except aiosqlite.OperationalError as e:
+            # Column might already exist
+            if "duplicate column" not in str(e).lower():
+                raise
+        
+        # Create items cache table
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS items (
+                item_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                type TEXT,
+                market_value INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_updated INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+        
+        # Add discord_id column to players table
+        try:
+            await self.connection.execute("""
+                ALTER TABLE players
+                ADD COLUMN discord_id TEXT
+            """)
+        except aiosqlite.OperationalError as e:
+            # Column might already exist
+            if "duplicate column" not in str(e).lower():
+                raise
+        
+        # Create index on items table
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_items_item_id 
+            ON items(item_id)
+        """)
+        
+        # Create index on players discord_id
+        await self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_players_discord_id 
+            ON players(discord_id)
+        """)
+        
+        await self.connection.commit()
+    
     # Competition methods
     async def create_competition(
         self,
@@ -1771,3 +1996,623 @@ class TornDatabase:
                 result.append(row_dict)
         
         return result, total_count
+    
+    # Organized crime methods
+    async def upsert_organized_crime_current(
+        self,
+        faction_id: int,
+        crime_id: int,
+        crime_name: str,
+        crime_type: Optional[str] = None,
+        participants: List[int] = None,
+        participant_count: Optional[int] = None,
+        required_participants: Optional[int] = None,
+        time_started: Optional[int] = None,
+        time_completed: Optional[int] = None,
+        status: str = 'planning',
+        reward_money: Optional[int] = None,
+        reward_respect: Optional[int] = None,
+        reward_other: Optional[str] = None,
+        data_source: Optional[str] = None
+    ):
+        """Upsert current organized crime state."""
+        await self._ensure_connected()
+        now = int(datetime.utcnow().timestamp())
+        
+        if participants is None:
+            participants = []
+        if participant_count is None:
+            participant_count = len(participants)
+        
+        participants_json = json.dumps(participants)
+        
+        await self.connection.execute("""
+            INSERT INTO organized_crimes_current (
+                faction_id, crime_id, crime_name, crime_type, participants, participant_count,
+                required_participants, time_started, time_completed, status,
+                reward_money, reward_respect, reward_other, last_updated, data_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(faction_id, crime_id) DO UPDATE SET
+                crime_name = excluded.crime_name,
+                crime_type = COALESCE(excluded.crime_type, organized_crimes_current.crime_type),
+                participants = excluded.participants,
+                participant_count = excluded.participant_count,
+                required_participants = COALESCE(excluded.required_participants, organized_crimes_current.required_participants),
+                time_started = COALESCE(excluded.time_started, organized_crimes_current.time_started),
+                time_completed = COALESCE(excluded.time_completed, organized_crimes_current.time_completed),
+                status = excluded.status,
+                reward_money = COALESCE(excluded.reward_money, organized_crimes_current.reward_money),
+                reward_respect = COALESCE(excluded.reward_respect, organized_crimes_current.reward_respect),
+                reward_other = COALESCE(excluded.reward_other, organized_crimes_current.reward_other),
+                last_updated = excluded.last_updated,
+                data_source = COALESCE(excluded.data_source, organized_crimes_current.data_source)
+        """, (faction_id, crime_id, crime_name, crime_type, participants_json, participant_count,
+              required_participants, time_started, time_completed, status,
+              reward_money, reward_respect, reward_other, now, data_source))
+        await self.connection.commit()
+    
+    async def get_organized_crimes_current(self, faction_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get current organized crimes, optionally filtered by faction."""
+        await self._ensure_connected()
+        
+        if faction_id:
+            query = """
+                SELECT id, faction_id, crime_id, crime_name, crime_type, participants, participant_count,
+                       required_participants, time_started, time_completed, status,
+                       reward_money, reward_respect, reward_other, created_at, last_updated, data_source
+                FROM organized_crimes_current
+                WHERE faction_id = ?
+                ORDER BY time_started DESC, crime_id DESC
+            """
+            params = (faction_id,)
+        else:
+            query = """
+                SELECT id, faction_id, crime_id, crime_name, crime_type, participants, participant_count,
+                       required_participants, time_started, time_completed, status,
+                       reward_money, reward_respect, reward_other, created_at, last_updated, data_source
+                FROM organized_crimes_current
+                ORDER BY faction_id, time_started DESC, crime_id DESC
+            """
+            params = ()
+        
+        crimes = []
+        async with self.connection.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                participants_json = row[5]
+                try:
+                    participants = json.loads(participants_json) if participants_json else []
+                except (json.JSONDecodeError, TypeError):
+                    participants = []
+                
+                crimes.append({
+                    'id': row[0],
+                    'faction_id': row[1],
+                    'crime_id': row[2],
+                    'crime_name': row[3],
+                    'crime_type': row[4],
+                    'participants': participants,
+                    'participant_count': row[6],
+                    'required_participants': row[7],
+                    'time_started': row[8],
+                    'time_completed': row[9],
+                    'status': row[10],
+                    'reward_money': row[11],
+                    'reward_respect': row[12],
+                    'reward_other': row[13],
+                    'created_at': row[14],
+                    'last_updated': row[15],
+                    'data_source': row[16]
+                })
+        return crimes
+    
+    async def delete_organized_crime_current(self, faction_id: int, crime_id: int):
+        """Remove a crime from current table (after completion/failure)."""
+        await self._ensure_connected()
+        await self.connection.execute("""
+            DELETE FROM organized_crimes_current
+            WHERE faction_id = ? AND crime_id = ?
+        """, (faction_id, crime_id))
+        await self.connection.commit()
+    
+    async def append_organized_crime_history(
+        self,
+        faction_id: int,
+        crime_id: int,
+        event_type: str,
+        player_id: Optional[int] = None,
+        old_status: Optional[str] = None,
+        new_status: Optional[str] = None,
+        old_participants: Optional[List[int]] = None,
+        new_participants: Optional[List[int]] = None,
+        reward_money: Optional[int] = None,
+        reward_respect: Optional[int] = None,
+        reward_other: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        data_source: Optional[str] = None,
+        event_timestamp: Optional[int] = None
+    ):
+        """Append organized crime history event."""
+        await self._ensure_connected()
+        
+        if event_timestamp is None:
+            event_timestamp = int(datetime.utcnow().timestamp())
+        
+        old_participants_json = json.dumps(old_participants) if old_participants else None
+        new_participants_json = json.dumps(new_participants) if new_participants else None
+        metadata_json = json.dumps(metadata) if metadata else None
+        
+        await self.connection.execute("""
+            INSERT INTO organized_crimes_history (
+                faction_id, crime_id, event_type, event_timestamp, player_id,
+                old_status, new_status, old_participants, new_participants,
+                reward_money, reward_respect, reward_other, metadata, data_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (faction_id, crime_id, event_type, event_timestamp, player_id,
+              old_status, new_status, old_participants_json, new_participants_json,
+              reward_money, reward_respect, reward_other, metadata_json, data_source))
+        await self.connection.commit()
+    
+    async def get_organized_crime_history(
+        self,
+        faction_id: int,
+        crime_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get organized crime history."""
+        await self._ensure_connected()
+        
+        conditions = ["faction_id = ?"]
+        params = [faction_id]
+        
+        if crime_id:
+            conditions.append("crime_id = ?")
+            params.append(crime_id)
+        
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        
+        where_clause = " AND ".join(conditions)
+        
+        query = f"""
+            SELECT id, faction_id, crime_id, event_type, event_timestamp, player_id,
+                   old_status, new_status, old_participants, new_participants,
+                   reward_money, reward_respect, reward_other, metadata, data_source
+            FROM organized_crimes_history
+            WHERE {where_clause}
+            ORDER BY event_timestamp DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        
+        history = []
+        async with self.connection.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                old_participants = None
+                new_participants = None
+                metadata = None
+                
+                if row[8]:
+                    try:
+                        old_participants = json.loads(row[8])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                if row[9]:
+                    try:
+                        new_participants = json.loads(row[9])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                if row[13]:
+                    try:
+                        metadata = json.loads(row[13])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                history.append({
+                    'id': row[0],
+                    'faction_id': row[1],
+                    'crime_id': row[2],
+                    'event_type': row[3],
+                    'event_timestamp': row[4],
+                    'player_id': row[5],
+                    'old_status': row[6],
+                    'new_status': row[7],
+                    'old_participants': old_participants,
+                    'new_participants': new_participants,
+                    'reward_money': row[10],
+                    'reward_respect': row[11],
+                    'reward_other': row[12],
+                    'metadata': metadata,
+                    'data_source': row[14]
+                })
+        return history
+    
+    async def get_participant_crime_leaves(
+        self,
+        faction_id: int,
+        player_id: int,
+        days: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Get crimes a participant left within the time window."""
+        await self._ensure_connected()
+        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        
+        query = """
+            SELECT id, faction_id, crime_id, event_type, event_timestamp, player_id,
+                   old_status, new_status, old_participants, new_participants, metadata
+            FROM organized_crimes_history
+            WHERE faction_id = ? AND player_id = ? AND event_type = 'participant_left'
+            AND event_timestamp >= ?
+            ORDER BY event_timestamp DESC
+        """
+        
+        leaves = []
+        async with self.connection.execute(query, (faction_id, player_id, cutoff_timestamp)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                old_participants = None
+                new_participants = None
+                metadata = None
+                
+                if row[8]:
+                    try:
+                        old_participants = json.loads(row[8])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                if row[9]:
+                    try:
+                        new_participants = json.loads(row[9])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                if row[10]:
+                    try:
+                        metadata = json.loads(row[10])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                leaves.append({
+                    'id': row[0],
+                    'faction_id': row[1],
+                    'crime_id': row[2],
+                    'event_type': row[3],
+                    'event_timestamp': row[4],
+                    'player_id': row[5],
+                    'old_status': row[6],
+                    'new_status': row[7],
+                    'old_participants': old_participants,
+                    'new_participants': new_participants,
+                    'metadata': metadata
+                })
+        return leaves
+    
+    async def get_organized_crime_config(
+        self,
+        faction_id: int,
+        guild_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get organized crime configuration for a faction/guild."""
+        await self._ensure_connected()
+        
+        async with self.connection.execute("""
+            SELECT id, faction_id, guild_id, enabled, notification_channel_id,
+                   frequent_leaver_threshold, tracking_window_days, faction_lead_discord_ids,
+                   auto_sync_enabled, last_sync, missing_item_reminder_channel_id,
+                   created_at, last_updated
+            FROM organized_crimes_config
+            WHERE faction_id = ? AND guild_id = ?
+        """, (faction_id, guild_id)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            
+            lead_ids = None
+            if row[7]:
+                try:
+                    lead_ids = json.loads(row[7])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            return {
+                'id': row[0],
+                'faction_id': row[1],
+                'guild_id': row[2],
+                'enabled': bool(row[3]),
+                'notification_channel_id': row[4],
+                'frequent_leaver_threshold': row[5],
+                'tracking_window_days': row[6],
+                'faction_lead_discord_ids': lead_ids or [],
+                'auto_sync_enabled': bool(row[8]),
+                'last_sync': row[9],
+                'missing_item_reminder_channel_id': row[10],
+                'created_at': row[11],
+                'last_updated': row[12]
+            }
+    
+    async def upsert_organized_crime_config(
+        self,
+        faction_id: int,
+        guild_id: str,
+        enabled: Optional[bool] = None,
+        notification_channel_id: Optional[str] = None,
+        frequent_leaver_threshold: Optional[int] = None,
+        tracking_window_days: Optional[int] = None,
+        faction_lead_discord_ids: Optional[List[str]] = None,
+        auto_sync_enabled: Optional[bool] = None,
+        missing_item_reminder_channel_id: Optional[str] = None
+    ):
+        """Create or update organized crime configuration."""
+        await self._ensure_connected()
+        now = int(datetime.utcnow().timestamp())
+        
+        lead_ids_json = json.dumps(faction_lead_discord_ids) if faction_lead_discord_ids else None
+        
+        # Get existing config to preserve values
+        existing = await self.get_organized_crime_config(faction_id, guild_id)
+        
+        if existing:
+            # Update existing
+            final_enabled = enabled if enabled is not None else existing['enabled']
+            final_channel = notification_channel_id if notification_channel_id is not None else existing['notification_channel_id']
+            final_threshold = frequent_leaver_threshold if frequent_leaver_threshold is not None else existing['frequent_leaver_threshold']
+            final_window = tracking_window_days if tracking_window_days is not None else existing['tracking_window_days']
+            final_leads = lead_ids_json if faction_lead_discord_ids is not None else json.dumps(existing['faction_lead_discord_ids'])
+            final_auto_sync = auto_sync_enabled if auto_sync_enabled is not None else existing['auto_sync_enabled']
+            final_missing_item_channel = missing_item_reminder_channel_id if missing_item_reminder_channel_id is not None else existing.get('missing_item_reminder_channel_id')
+            
+            await self.connection.execute("""
+                UPDATE organized_crimes_config SET
+                    enabled = ?,
+                    notification_channel_id = ?,
+                    frequent_leaver_threshold = ?,
+                    tracking_window_days = ?,
+                    faction_lead_discord_ids = ?,
+                    auto_sync_enabled = ?,
+                    missing_item_reminder_channel_id = ?,
+                    last_updated = ?
+                WHERE faction_id = ? AND guild_id = ?
+            """, (final_enabled, final_channel, final_threshold, final_window, final_leads,
+                  final_auto_sync, final_missing_item_channel, now, faction_id, guild_id))
+        else:
+            # Insert new
+            final_enabled = enabled if enabled is not None else True
+            final_channel = notification_channel_id
+            final_threshold = frequent_leaver_threshold if frequent_leaver_threshold is not None else 2
+            final_window = tracking_window_days if tracking_window_days is not None else 30
+            final_leads = lead_ids_json
+            final_auto_sync = auto_sync_enabled if auto_sync_enabled is not None else True
+            final_missing_item_channel = missing_item_reminder_channel_id
+            
+            await self.connection.execute("""
+                INSERT INTO organized_crimes_config (
+                    faction_id, guild_id, enabled, notification_channel_id,
+                    frequent_leaver_threshold, tracking_window_days, faction_lead_discord_ids,
+                    auto_sync_enabled, missing_item_reminder_channel_id, created_at, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (faction_id, guild_id, final_enabled, final_channel, final_threshold,
+                  final_window, final_leads, final_auto_sync, final_missing_item_channel, now, now))
+        
+        await self.connection.commit()
+    
+    async def update_organized_crime_config_sync_time(
+        self,
+        faction_id: int,
+        guild_id: str,
+        sync_timestamp: int
+    ):
+        """Update last sync timestamp for a config."""
+        await self._ensure_connected()
+        await self.connection.execute("""
+            UPDATE organized_crimes_config
+            SET last_sync = ?, last_updated = ?
+            WHERE faction_id = ? AND guild_id = ?
+        """, (sync_timestamp, sync_timestamp, faction_id, guild_id))
+        await self.connection.commit()
+    
+    async def get_all_tracked_factions(self) -> List[Dict[str, Any]]:
+        """Get all factions with organized crime tracking enabled."""
+        await self._ensure_connected()
+        
+        factions = []
+        async with self.connection.execute("""
+            SELECT id, faction_id, guild_id, enabled, notification_channel_id,
+                   frequent_leaver_threshold, tracking_window_days, faction_lead_discord_ids,
+                   auto_sync_enabled, last_sync, missing_item_reminder_channel_id,
+                   created_at, last_updated
+            FROM organized_crimes_config
+            WHERE enabled = 1 AND auto_sync_enabled = 1
+            ORDER BY faction_id
+        """) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                lead_ids = None
+                if row[7]:
+                    try:
+                        lead_ids = json.loads(row[7])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                
+                factions.append({
+                    'id': row[0],
+                    'faction_id': row[1],
+                    'guild_id': row[2],
+                    'enabled': bool(row[3]),
+                    'notification_channel_id': row[4],
+                    'frequent_leaver_threshold': row[5],
+                    'tracking_window_days': row[6],
+                    'faction_lead_discord_ids': lead_ids or [],
+                    'auto_sync_enabled': bool(row[8]),
+                    'last_sync': row[9],
+                    'missing_item_reminder_channel_id': row[10],
+                    'created_at': row[11],
+                    'last_updated': row[12]
+                })
+        return factions
+    
+    async def update_participant_crime_stats(
+        self,
+        faction_id: int,
+        player_id: int,
+        crime_type: Optional[str],
+        crimes_started: int = 0,
+        crimes_completed: int = 0,
+        crimes_failed: int = 0,
+        crimes_left: int = 0,
+        total_reward_money: int = 0,
+        total_reward_respect: int = 0,
+        period_start: Optional[int] = None,
+        period_end: Optional[int] = None
+    ):
+        """Update participant crime statistics."""
+        await self._ensure_connected()
+        
+        # Default to current month if not specified
+        if period_start is None or period_end is None:
+            now = datetime.utcnow()
+            period_start = int(datetime(now.year, now.month, 1).timestamp())
+            if now.month == 12:
+                period_end = int(datetime(now.year + 1, 1, 1).timestamp()) - 1
+            else:
+                period_end = int(datetime(now.year, now.month + 1, 1).timestamp()) - 1
+        
+        await self.connection.execute("""
+            INSERT INTO organized_crimes_participant_stats (
+                faction_id, player_id, crime_type, crimes_started, crimes_completed,
+                crimes_failed, crimes_left, total_reward_money, total_reward_respect,
+                period_start, period_end, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            ON CONFLICT(faction_id, player_id, crime_type, period_start, period_end) DO UPDATE SET
+                crimes_started = crimes_started + excluded.crimes_started,
+                crimes_completed = crimes_completed + excluded.crimes_completed,
+                crimes_failed = crimes_failed + excluded.crimes_failed,
+                crimes_left = crimes_left + excluded.crimes_left,
+                total_reward_money = total_reward_money + excluded.total_reward_money,
+                total_reward_respect = total_reward_respect + excluded.total_reward_respect,
+                last_updated = excluded.last_updated
+        """, (faction_id, player_id, crime_type, crimes_started, crimes_completed,
+              crimes_failed, crimes_left, total_reward_money, total_reward_respect,
+              period_start, period_end))
+        await self.connection.commit()
+    
+    async def get_frequent_leavers(
+        self,
+        faction_id: int,
+        threshold: int = 2,
+        days: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Get players who have left more than threshold crimes in the time window."""
+        await self._ensure_connected()
+        cutoff_timestamp = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        
+        query = """
+            SELECT player_id, COUNT(*) as leave_count
+            FROM organized_crimes_history
+            WHERE faction_id = ? AND event_type = 'participant_left'
+            AND event_timestamp >= ?
+            GROUP BY player_id
+            HAVING leave_count > ?
+            ORDER BY leave_count DESC
+        """
+        
+        leavers = []
+        async with self.connection.execute(query, (faction_id, cutoff_timestamp, threshold)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                leavers.append({
+                    'player_id': row[0],
+                    'leave_count': row[1]
+                })
+        return leavers
+    
+    # Item cache methods
+    async def get_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        """Get item from cache by item_id."""
+        await self._ensure_connected()
+        
+        async with self.connection.execute("""
+            SELECT item_id, name, description, type, market_value, created_at, last_updated
+            FROM items
+            WHERE item_id = ?
+        """, (item_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            
+            return {
+                'item_id': row[0],
+                'name': row[1],
+                'description': row[2],
+                'type': row[3],
+                'market_value': row[4],
+                'created_at': row[5],
+                'last_updated': row[6]
+            }
+    
+    async def upsert_item(
+        self,
+        item_id: int,
+        name: str,
+        description: Optional[str] = None,
+        item_type: Optional[str] = None,
+        market_value: Optional[int] = None
+    ):
+        """Insert or update item in cache."""
+        await self._ensure_connected()
+        now = int(datetime.utcnow().timestamp())
+        
+        await self.connection.execute("""
+            INSERT INTO items (item_id, name, description, type, market_value, created_at, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                type = excluded.type,
+                market_value = excluded.market_value,
+                last_updated = excluded.last_updated
+        """, (item_id, name, description, item_type, market_value, now, now))
+        await self.connection.commit()
+    
+    # Player discord_id methods
+    async def get_player_discord_id(self, player_id: int) -> Optional[str]:
+        """Get discord_id for a player from players table."""
+        await self._ensure_connected()
+        
+        async with self.connection.execute("""
+            SELECT discord_id FROM players WHERE player_id = ?
+        """, (player_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            return row[0]
+    
+    async def update_player_discord_id(self, player_id: int, discord_id: Optional[str]):
+        """Update discord_id for a player."""
+        await self._ensure_connected()
+        now = int(datetime.utcnow().timestamp())
+        
+        # First check if player exists
+        async with self.connection.execute("""
+            SELECT player_id FROM players WHERE player_id = ?
+        """, (player_id,)) as cursor:
+            exists = await cursor.fetchone()
+        
+        if exists:
+            # Update existing player
+            await self.connection.execute("""
+                UPDATE players SET discord_id = ?, last_updated = ?
+                WHERE player_id = ?
+            """, (discord_id, now, player_id))
+        else:
+            # Insert new player with minimal data (name required)
+            await self.connection.execute("""
+                INSERT INTO players (player_id, name, discord_id, created_at, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+            """, (player_id, f"Player {player_id}", discord_id, now, now))
+        
+        await self.connection.commit()

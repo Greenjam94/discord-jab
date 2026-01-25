@@ -14,8 +14,9 @@ class TornAPIError(Exception):
 
 class TornAPIClient:
     """Client for interacting with the Torn API."""
-    
+
     BASE_URL = "https://api.torn.com"
+    BASE_URL_V2 = "https://api.torn.com/v2"
     
     # Error code messages from Torn API documentation
     ERROR_MESSAGES = {
@@ -84,18 +85,19 @@ class TornAPIClient:
         self,
         endpoint: str,
         key: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        use_v2: bool = False
     ) -> Dict[str, Any]:
-        """Make a request to the Torn API."""
+        """Make a request to the Torn API. use_v2: use API v2 base URL."""
         if not self._check_rate_limit(key):
             raise TornAPIError(
                 f"Rate limit exceeded. Maximum {self.max_requests_per_minute} requests per minute."
             )
         
         session = await self._get_session()
-        
-        # Build URL
-        url = f"{self.BASE_URL}/{endpoint}"
+        base = self.BASE_URL_V2 if use_v2 else self.BASE_URL
+        url = f"{base}/{endpoint}"
         
         # Add key to params
         request_params = params or {}
@@ -148,7 +150,8 @@ class TornAPIClient:
         key: str,
         faction_id: Optional[int] = None,
         selections: Optional[list] = None,
-        stat: Optional[str] = None
+        stat: Optional[str] = None,
+        use_v2: bool = False
     ) -> Dict[str, Any]:
         """Get faction information.
         
@@ -157,6 +160,7 @@ class TornAPIClient:
             faction_id: Optional faction ID (uses key owner's faction if not provided)
             selections: List of selections (e.g., ['basic', 'contributors'])
             stat: Optional stat name for contributors selection (e.g., 'gymstrength')
+            use_v2: Use API v2 endpoint (default: False)
         """
         endpoint = "faction"
         if faction_id:
@@ -170,7 +174,7 @@ class TornAPIClient:
         if stat:
             params['stat'] = stat
         
-        return await self._make_request(endpoint, key, params)
+        return await self._make_request(endpoint, key, params, use_v2=use_v2)
     
     async def get_key_info(self, key: str) -> Dict[str, Any]:
         """Get information about an API key."""
@@ -234,3 +238,66 @@ class TornAPIClient:
             params['selections'] = ','.join(selections)
         
         return await self._make_request("torn", key, params)
+    
+    async def get_organized_crimes(self, key: str) -> Dict[str, Any]:
+        """Get list of available organized crimes (public endpoint, v2).
+        
+        Returns general information about available organized crimes.
+        """
+        return await self._make_request("torn", key, {'selections': 'organizedcrimes'}, use_v2=True)
+    
+    async def get_faction_crimes(
+        self,
+        key: str,
+        offset: Optional[int] = None,
+        sort: Optional[str] = None,
+        cat: Optional[str] = None,
+        from_timestamp: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Get faction crime data (requires faction permission, v2).
+        
+        Uses the key owner's faction automatically.
+        
+        Args:
+            key: API key with faction permission (must be from a member of the faction)
+            offset: Optional offset for pagination (default: 0)
+            sort: Optional sort order - "ASC" or "DESC" (default: "DESC")
+            cat: Optional category filter - filter by status to include specific status only
+            from_timestamp: Optional unix timestamp to limit results to crimes created after this time
+        
+        Returns current and historical crime data for the key owner's faction.
+        """
+        params = {}
+        if offset is not None:
+            params['offset'] = offset
+        if sort:
+            params['sort'] = sort
+        if cat:
+            params['cat'] = cat
+        if from_timestamp is not None:
+            params['from'] = from_timestamp
+        
+        # Endpoint is /v2/faction/crimes (not /v2/faction with selections=crime)
+        return await self._make_request("faction/crimes", key, params, use_v2=True)
+    
+    async def get_item(self, key: str, item_id: int) -> Dict[str, Any]:
+        """Get item information from Torn API (v2).
+        
+        Args:
+            key: API key
+            item_id: Item ID to look up
+        
+        Returns item details including name, description, type, market_value, etc.
+        """
+        return await self._make_request(f"torn/{item_id}/items", key, {}, use_v2=True)
+    
+    async def get_user_discord(self, key: str, user_id: int) -> Dict[str, Any]:
+        """Get user Discord information from Torn API (v2).
+        
+        Args:
+            key: API key
+            user_id: User ID to look up
+        
+        Returns user data including discord object with discord_id if linked.
+        """
+        return await self._make_request(f"user/{user_id}/discord", key, {}, use_v2=True)
