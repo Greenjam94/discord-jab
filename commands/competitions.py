@@ -685,12 +685,14 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="competition-team-roster", description="List players on each team for a competition")
     @discord.app_commands.describe(
         competition_id="ID of the competition",
-        team_id="Optional: show only this team's roster"
+        team_id="Optional: show only this team's roster",
+        visible="If true, show roster in channel for everyone to see (default: false, only you see it)"
     )
     async def competition_team_roster(
         interaction: discord.Interaction,
         competition_id: int,
-        team_id: Optional[int] = None
+        team_id: Optional[int] = None,
+        visible: bool = False
     ):
         """List players on each team so you can see who is on which team."""
         await interaction.response.defer(ephemeral=True)
@@ -768,7 +770,7 @@ def setup(bot: commands.Bot):
                     inline=False
                 )
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=not visible)
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
