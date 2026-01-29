@@ -682,6 +682,99 @@ def setup(bot: commands.Bot):
             import traceback
             traceback.print_exc()
     
+    @bot.tree.command(name="competition-team-roster", description="List players on each team for a competition")
+    @discord.app_commands.describe(
+        competition_id="ID of the competition",
+        team_id="Optional: show only this team's roster"
+    )
+    async def competition_team_roster(
+        interaction: discord.Interaction,
+        competition_id: int,
+        team_id: Optional[int] = None
+    ):
+        """List players on each team so you can see who is on which team."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if not await check_database_available(bot, interaction):
+            return
+        
+        try:
+            comp = await validate_competition_exists(bot, competition_id, interaction)
+            if not comp:
+                return
+            
+            teams = await bot.database.get_competition_teams(competition_id)
+            participants = await bot.database.get_competition_participants(competition_id)
+            
+            if not participants:
+                await interaction.followup.send("❌ No participants found for this competition.", ephemeral=True)
+                return
+            
+            # Filter by team_id if provided
+            if team_id is not None:
+                teams = [t for t in teams if t["id"] == team_id]
+                if not teams:
+                    await interaction.followup.send(f"❌ Team with ID {team_id} not found.", ephemeral=True)
+                    return
+                participants = [p for p in participants if p.get("team_id") == team_id]
+            
+            # Group participants by team
+            team_roster = {}  # team_id -> list of {player_name, player_id}
+            no_team = []
+            team_names = {t["id"]: t["team_name"] for t in teams}
+            
+            for p in participants:
+                name = p.get("player_name") or f"Player {p['player_id']}"
+                entry = f"{name} [{p['player_id']}]"
+                tid = p.get("team_id")
+                if tid is not None:
+                    if tid not in team_roster:
+                        team_roster[tid] = []
+                    team_roster[tid].append(entry)
+                else:
+                    no_team.append(entry)
+            
+            status_emoji = get_status_emoji(comp["status"])
+            embed = discord.Embed(
+                title=f"{status_emoji} Team Roster: {comp['name']}",
+                color=discord.Color.blue(),
+                description="Players on each team."
+            )
+            
+            # One field per team (and one for "No team" if any)
+            max_value_len = 1024
+            for team in teams:
+                tid = team["id"]
+                roster = team_roster.get(tid, [])
+                team_name = team["team_name"]
+                lines = [f"• {line}" for line in roster]
+                value = "\n".join(lines) if lines else "*No players assigned*"
+                if len(value) > max_value_len:
+                    value = value[: max_value_len - 20] + "\n... (truncated)"
+                embed.add_field(
+                    name=f"{team_name} ({len(roster)} players)",
+                    value=value,
+                    inline=False
+                )
+            
+            if no_team and team_id is None:
+                lines = [f"• {line}" for line in no_team]
+                value = "\n".join(lines)
+                if len(value) > max_value_len:
+                    value = value[: max_value_len - 20] + "\n... (truncated)"
+                embed.add_field(
+                    name="No team assigned",
+                    value=value,
+                    inline=False
+                )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+            import traceback
+            traceback.print_exc()
+
     @bot.tree.command(name="competition-faction-overview", description="Get overall faction improvement summary")
     @discord.app_commands.describe(
         competition_id="ID of the competition"
