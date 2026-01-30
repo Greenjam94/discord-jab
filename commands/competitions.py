@@ -854,6 +854,9 @@ def setup(bot: commands.Bot):
             
             player_name = participant["player_name"] or f"Player {player_id}"
             total = len(rankings)
+            player_ranking_entry = next((r for r in rankings if r["player_id"] == player_id), None)
+            player_delta = player_ranking_entry["delta"] if player_ranking_entry else None
+            delta_str = format_number_with_sign(player_delta) if player_delta is not None else "—"
             
             embed = discord.Embed(
                 title=f"Competition: {comp['name']}",
@@ -864,6 +867,11 @@ def setup(bot: commands.Bot):
                 name="Player",
                 value=f"{player_name} [{player_id}]",
                 inline=False
+            )
+            embed.add_field(
+                name="Change since start",
+                value=delta_str,
+                inline=True
             )
             embed.add_field(
                 name="Overall Ranking",
