@@ -695,7 +695,7 @@ def setup(bot: commands.Bot):
         visible: bool = False
     ):
         """List players on each team so you can see who is on which team."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not visible)
         
         if not await check_database_available(bot, interaction):
             return
@@ -775,11 +775,7 @@ def setup(bot: commands.Bot):
                 lines = []
                 for i, m in enumerate(roster, 1):
                     delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
-                    current_str = f"{m['current_stat']:,.0f}" if m["current_stat"] is not None else "N/A"
-                    lines.append(
-                        f"**{i}.** {m['player_name']} [{m['player_id']}]\n"
-                        f"   Change: {delta_str} | Current: {current_str}"
-                    )
+                    lines.append(f"{i}. {m['player_name']} [{m['player_id']}] {delta_str}")
                 value = "\n".join(lines) if lines else "*No players assigned*"
                 if len(value) > max_value_len:
                     value = value[: max_value_len - 20] + "\n... (truncated)"
@@ -793,11 +789,7 @@ def setup(bot: commands.Bot):
                 lines = []
                 for i, m in enumerate(no_team, 1):
                     delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
-                    current_str = f"{m['current_stat']:,.0f}" if m["current_stat"] is not None else "N/A"
-                    lines.append(
-                        f"**{i}.** {m['player_name']} [{m['player_id']}]\n"
-                        f"   Change: {delta_str} | Current: {current_str}"
-                    )
+                    lines.append(f"{i}. {m['player_name']} [{m['player_id']}] {delta_str}")
                 value = "\n".join(lines)
                 if len(value) > max_value_len:
                     value = value[: max_value_len - 20] + "\n... (truncated)"
