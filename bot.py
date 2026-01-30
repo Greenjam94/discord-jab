@@ -259,33 +259,36 @@ async def before_monthly_task():
     # Wait until next hour to avoid running immediately on startup
     await asyncio.sleep(3600)  # Wait 1 hour
 
-@tasks.loop(hours=24)  # Run daily
-async def daily_competition_stats_update_task():
-    """Background task to update stats for all active competitions daily."""
+@tasks.loop(hours=1)  # Run every hour on the hour
+async def hourly_competition_stats_update_task():
+    """Background task to update stats for all active competitions every hour."""
     if not hasattr(bot, 'database') or not bot.database:
         return
     
-    print('📊 Starting daily competition stats update...')
+    print('📊 Starting hourly competition stats update...')
     
     try:
         from commands.competitions import _update_competition_stats_helper
         result = await _update_competition_stats_helper(bot)
         
         if result.get("error"):
-            print(f'❌ Daily competition stats update error: {result.get("error")}')
+            print(f'❌ Hourly competition stats update error: {result.get("error")}')
         else:
-            print(f'✅ Daily competition stats update completed: {result.get("message")}')
+            print(f'✅ Hourly competition stats update completed: {result.get("message")}')
     except Exception as e:
-        print(f'❌ Daily competition stats update error: {e}')
+        print(f'❌ Hourly competition stats update error: {e}')
         import traceback
         traceback.print_exc()
 
-@daily_competition_stats_update_task.before_loop
-async def before_daily_competition_task():
-    """Wait until bot is ready before starting the task."""
+@hourly_competition_stats_update_task.before_loop
+async def before_hourly_competition_task():
+    """Wait until bot is ready, then until the next full hour (:00)."""
     await bot.wait_until_ready()
-    # Wait until next hour to avoid running immediately on startup
-    await asyncio.sleep(3600)  # Wait 1 hour
+    # Align first run to the top of the next hour
+    now = datetime.utcnow()
+    secs_into_hour = now.minute * 60 + now.second
+    secs_until_next_hour = 3600 - secs_into_hour
+    await asyncio.sleep(secs_until_next_hour)
 
 @tasks.loop(minutes=2)  # Update every 2 minutes (for heartbeat)
 async def update_bot_instances_task():
@@ -435,9 +438,9 @@ async def on_ready():
         monthly_summarization_task.start()
         print('✅ Monthly summarization task started')
         
-        # Start daily competition stats update task
-        daily_competition_stats_update_task.start()
-        print('✅ Daily competition stats update task started')
+        # Start hourly competition stats update task
+        hourly_competition_stats_update_task.start()
+        print('✅ Hourly competition stats update task started')
         
         # Start bot instances update task
         update_bot_instances_task.start()
