@@ -1,6 +1,6 @@
 """Simple Flask web interface for database browsing."""
 
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, Response
 import aiosqlite
 import asyncio
 from pathlib import Path
@@ -1865,6 +1865,139 @@ def get_competition_progress_data_sync(
         loop.close()
 
 
+async def get_competition_stats_history_table_async(competition_id: int) -> Dict[str, Any]:
+    """Get full competition player stats history as table data (rows = timestamps, columns = players).
+    
+    Returns:
+        Dict with competition, column_headers, rows (list of row lists), participants.
+    """
+    from database import TornDatabase
+
+    db = TornDatabase(DB_PATH)
+    await db.connect()
+    try:
+        comp = await db.get_competition(competition_id)
+        if not comp:
+            return {'error': 'Competition not found'}
+
+        tracked_stat = comp['tracked_stat']
+        start_date = comp['start_date']
+        end_date = comp['end_date']
+
+        participants = await db.get_competition_participants(competition_id)
+        if not participants:
+            return {'error': 'No participants found'}
+
+        teams = await db.get_competition_teams(competition_id)
+        team_map = {t['id']: t['team_name'] for t in teams}
+
+        start_stats = {}
+        for p in participants:
+            pid = p['player_id']
+            start_stat = await db.get_competition_start_stat(competition_id, pid)
+            start_stats[pid] = start_stat if start_stat is not None else 0.0
+
+        if tracked_stat == "gym_e_spent":
+            stat_names = ["gymstrength", "gymdefense", "gymspeed", "gymdexterity"]
+        else:
+            stat_names = [tracked_stat]
+
+        participant_ids = [p['player_id'] for p in participants]
+        placeholders_p = ','.join('?' * len(participant_ids))
+        placeholders_s = ','.join('?' * len(stat_names))
+        params = participant_ids + stat_names + [start_date, end_date]
+
+        history_data = {}
+        async with db.connection.execute(f"""
+            SELECT player_id, timestamp, value
+            FROM player_contributor_history
+            WHERE player_id IN ({placeholders_p})
+            AND stat_name IN ({placeholders_s})
+            AND timestamp >= ? AND timestamp <= ?
+            ORDER BY player_id, timestamp ASC
+        """, params) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                player_id, timestamp, value = row
+                if player_id not in history_data:
+                    history_data[player_id] = []
+                history_data[player_id].append((timestamp, value))
+
+        if tracked_stat == "gym_e_spent":
+            processed = {}
+            for pid, data_points in history_data.items():
+                by_ts = {}
+                for ts, val in data_points:
+                    by_ts[ts] = by_ts.get(ts, 0.0) + val
+                processed[pid] = sorted(by_ts.items())
+            history_data = processed
+
+        all_timestamps = set()
+        for pid in history_data:
+            for ts, _ in history_data[pid]:
+                all_timestamps.add(ts)
+        all_timestamps = sorted(all_timestamps)
+
+        # Build value-at-timestamp per player (cumulative for progress)
+        # For each player: at each timestamp we need the latest value up to that time
+        def get_value_at(player_id: int, ts: int) -> Optional[float]:
+            if player_id not in history_data:
+                return None
+            val = None
+            for t, v in history_data[player_id]:
+                if t <= ts:
+                    val = v
+                else:
+                    break
+            return val
+
+        column_headers = ['Timestamp']
+        for p in participants:
+            name = p.get('player_name') or f"Player {p['player_id']}"
+            column_headers.append(f"{name} ({p['player_id']})")
+
+        table_rows = []
+        for ts in all_timestamps:
+            ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+            row = [ts_str]
+            for p in participants:
+                pid = p['player_id']
+                raw = get_value_at(pid, ts)
+                if raw is not None:
+                    start_val = start_stats.get(pid, 0.0)
+                    progress = raw - start_val
+                    row.append(f"{progress:,.2f}" if isinstance(progress, float) else str(progress))
+                else:
+                    row.append('')
+            table_rows.append(row)
+
+        participants_with_team = []
+        for p in participants:
+            p = dict(p)
+            p['team_name'] = team_map.get(p.get('team_id'), 'No Team') if p.get('team_id') else 'No Team'
+            participants_with_team.append(p)
+
+        return {
+            'competition': comp,
+            'column_headers': column_headers,
+            'rows': table_rows,
+            'participants': participants_with_team,
+            'tracked_stat': tracked_stat,
+        }
+    finally:
+        await db.close()
+
+
+def get_competition_stats_history_table_sync(competition_id: int) -> Dict[str, Any]:
+    """Sync wrapper for get_competition_stats_history_table_async."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(get_competition_stats_history_table_async(competition_id))
+    finally:
+        loop.close()
+
+
 @app.route('/competitions/<int:competition_id>/progress')
 def competition_progress(competition_id: int):
     """Competition progress graph page."""
@@ -2113,6 +2246,7 @@ def competition_progress(competition_id: int):
                 <a href="/">Database Browser</a>
                 <a href="/instances">Instances</a>
                 <a href="/competitions">← Back to Competitions</a>
+                <a href="/competitions/{competition_id}/stats-history">Player Stats History (Table)</a>
             </div>
             
             <div class="filters">
@@ -2236,6 +2370,168 @@ def competition_progress(competition_id: int):
     """
     
     return render_template_string(html)
+
+
+@app.route('/competitions/<int:competition_id>/stats-history')
+def competition_stats_history(competition_id: int):
+    """Competition player stats history table (rows = timestamps, columns = players)."""
+    data = get_competition_stats_history_table_sync(competition_id)
+    if 'error' in data:
+        return f"<h1>Error</h1><p>{data['error']}</p>", 404
+
+    comp = data['competition']
+    column_headers = data['column_headers']
+    rows = data['rows']
+    tracked_stat = data['tracked_stat']
+
+    headers_html = ''.join(f'<th>{h}</th>' for h in column_headers)
+    # First column (Timestamp) stays left-aligned; rest are numbers
+    rows_html = []
+    for row in rows:
+        cells = []
+        for i, cell in enumerate(row):
+            cls = 'number' if i > 0 and cell else ''
+            cells.append(f'<td class="{cls}">{cell}</td>')
+        rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+    rows_html = '\n'.join(rows_html)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Player Stats History - {comp['name']}</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                padding: 20px;
+                line-height: 1.6;
+            }}
+            .container {{ max-width: 1600px; margin: 0 auto; }}
+            h1 {{ color: #4ec9b0; margin-bottom: 10px; }}
+            .subtitle {{ color: #858585; margin-bottom: 20px; }}
+            .nav-links {{ margin-bottom: 20px; }}
+            .nav-links a {{ color: #4ec9b0; text-decoration: none; margin-right: 20px; }}
+            .nav-links a:hover {{ text-decoration: underline; }}
+            .toolbar {{
+                background: #252526;
+                padding: 15px 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border: 1px solid #3e3e42;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+            }}
+            .btn {{
+                padding: 10px 20px;
+                background: #007acc;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 500;
+                text-decoration: none;
+                display: inline-block;
+            }}
+            .btn:hover {{ background: #005a9e; }}
+            .btn-secondary {{
+                background: #3e3e42;
+                color: #d4d4d4;
+            }}
+            .btn-secondary:hover {{ background: #505050; }}
+            .table-container {{
+                background: #252526;
+                border-radius: 8px;
+                border: 1px solid #3e3e42;
+                overflow-x: auto;
+            }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+            thead {{ background: #2d2d30; position: sticky; top: 0; }}
+            th {{
+                padding: 12px;
+                text-align: left;
+                color: #4ec9b0;
+                font-weight: 600;
+                border-bottom: 2px solid #3e3e42;
+                white-space: nowrap;
+            }}
+            td {{
+                padding: 10px 12px;
+                border-bottom: 1px solid #3e3e42;
+            }}
+            td.number {{ text-align: right; color: #b5cea8; }}
+            tr:hover {{ background: #2d2d30; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📋 Player Stats History: {comp['name']}</h1>
+            <p class="subtitle">Tracked Stat: {tracked_stat} (progress from start)</p>
+
+            <div class="nav-links">
+                <a href="/">Database Browser</a>
+                <a href="/instances">Instances</a>
+                <a href="/competitions">← Back to Competitions</a>
+                <a href="/competitions/{competition_id}/progress">Progress Graph</a>
+            </div>
+
+            <div class="toolbar">
+                <a href="/competitions/{competition_id}/stats-history/csv" class="btn">Export to CSV</a>
+                <a href="/competitions/{competition_id}/progress" class="btn btn-secondary">View Progress Graph</a>
+            </div>
+
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>{headers_html}</tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+
+@app.route('/competitions/<int:competition_id>/stats-history/csv')
+def competition_stats_history_csv(competition_id: int):
+    """Export competition player stats history as CSV."""
+    data = get_competition_stats_history_table_sync(competition_id)
+    if 'error' in data:
+        return data['error'], 404
+
+    import csv
+    import io
+    comp = data['competition']
+    column_headers = data['column_headers']
+    rows = data['rows']
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(column_headers)
+    writer.writerows(rows)
+
+    filename = f"competition_{competition_id}_stats_history.csv"
+    # Sanitize comp name for filename
+    safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in comp.get('name', ''))
+    if safe_name:
+        filename = f"{safe_name}_{competition_id}_stats_history.csv"
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 @app.route('/competitions')
@@ -2446,6 +2742,7 @@ def competitions_list():
                 </div>
                 
                 <a href="/competitions/{comp['id']}/progress" class="btn">View Progress Graph</a>
+                <a href="/competitions/{comp['id']}/stats-history" class="btn" style="background: #3e3e42;">Player Stats History</a>
             </div>
             """
     
