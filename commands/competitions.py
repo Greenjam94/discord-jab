@@ -720,14 +720,26 @@ def setup(bot: commands.Bot):
                     return
                 participants = [p for p in participants if p.get("team_id") == team_id]
             
-            # Group participants by team
-            team_roster = {}  # team_id -> list of {player_name, player_id}
+            # Fetch start/current stat and delta for each participant (for ranking and "e spent since start")
+            tracked_stat = comp.get("tracked_stat") or "gym_e_spent"
+            team_roster = {}  # team_id -> list of {player_name, player_id, delta, current_stat}
             no_team = []
-            team_names = {t["id"]: t["team_name"] for t in teams}
-            
             for p in participants:
-                name = p.get("player_name") or f"Player {p['player_id']}"
-                entry = f"{name} [{p['player_id']}]"
+                player_id = p["player_id"]
+                name = p.get("player_name") or f"Player {player_id}"
+                start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
+                current_stat = await bot.database.get_player_current_stat_value(player_id, tracked_stat)
+                delta = None
+                if start_stat is not None and current_stat is not None:
+                    delta = current_stat - start_stat
+                elif start_stat is None:
+                    delta = 0.0
+                entry = {
+                    "player_name": name,
+                    "player_id": player_id,
+                    "delta": delta,
+                    "current_stat": current_stat,
+                }
                 tid = p.get("team_id")
                 if tid is not None:
                     if tid not in team_roster:
@@ -736,11 +748,22 @@ def setup(bot: commands.Bot):
                 else:
                     no_team.append(entry)
             
+            # Sort each team's roster by delta descending (highest first)
+            for tid in team_roster:
+                team_roster[tid].sort(
+                    key=lambda x: x["delta"] if x["delta"] is not None else float("-inf"),
+                    reverse=True,
+                )
+            no_team.sort(
+                key=lambda x: x["delta"] if x["delta"] is not None else float("-inf"),
+                reverse=True,
+            )
+            
             status_emoji = get_status_emoji(comp["status"])
             embed = discord.Embed(
                 title=f"{status_emoji} Team Roster: {comp['name']}",
                 color=discord.Color.blue(),
-                description="Players on each team."
+                description=f"Players on each team, ranked by highest **delta** ({tracked_stat}). Shows change since competition started."
             )
             
             # One field per team (and one for "No team" if any)
@@ -749,7 +772,14 @@ def setup(bot: commands.Bot):
                 tid = team["id"]
                 roster = team_roster.get(tid, [])
                 team_name = team["team_name"]
-                lines = [f"• {line}" for line in roster]
+                lines = []
+                for i, m in enumerate(roster, 1):
+                    delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
+                    current_str = f"{m['current_stat']:,.0f}" if m["current_stat"] is not None else "N/A"
+                    lines.append(
+                        f"**{i}.** {m['player_name']} [{m['player_id']}]\n"
+                        f"   Change: {delta_str} | Current: {current_str}"
+                    )
                 value = "\n".join(lines) if lines else "*No players assigned*"
                 if len(value) > max_value_len:
                     value = value[: max_value_len - 20] + "\n... (truncated)"
@@ -760,7 +790,14 @@ def setup(bot: commands.Bot):
                 )
             
             if no_team and team_id is None:
-                lines = [f"• {line}" for line in no_team]
+                lines = []
+                for i, m in enumerate(no_team, 1):
+                    delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
+                    current_str = f"{m['current_stat']:,.0f}" if m["current_stat"] is not None else "N/A"
+                    lines.append(
+                        f"**{i}.** {m['player_name']} [{m['player_id']}]\n"
+                        f"   Change: {delta_str} | Current: {current_str}"
+                    )
                 value = "\n".join(lines)
                 if len(value) > max_value_len:
                     value = value[: max_value_len - 20] + "\n... (truncated)"
