@@ -776,6 +776,117 @@ def setup(bot: commands.Bot):
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
             import traceback
             traceback.print_exc()
+    
+    @bot.tree.command(name="competition-player", description="Get a player's ranking in a competition (overall and on their team)")
+    @discord.app_commands.describe(
+        competition_id="ID of the competition",
+        player_id="Torn player ID"
+    )
+    async def competition_player(
+        interaction: discord.Interaction,
+        competition_id: int,
+        player_id: int
+    ):
+        """Show a player's name, overall rank, and team rank in the competition."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if not await check_database_available(bot, interaction):
+            return
+        
+        try:
+            comp = await validate_competition_exists(bot, competition_id, interaction)
+            if not comp:
+                return
+            
+            participants = await bot.database.get_competition_participants(competition_id)
+            participant = next((p for p in participants if p["player_id"] == player_id), None)
+            
+            if not participant:
+                await interaction.followup.send(
+                    f"❌ Player {player_id} is not a participant in this competition.",
+                    ephemeral=True
+                )
+                return
+            
+            # Build rankings with deltas (same logic as competition_status)
+            rankings = []
+            for p in participants:
+                pid = p["player_id"]
+                start_stat = await bot.database.get_competition_start_stat(competition_id, pid)
+                current_stat = await bot.database.get_player_current_stat_value(
+                    pid, comp["tracked_stat"]
+                )
+                delta = None
+                if start_stat is not None and current_stat is not None:
+                    delta = current_stat - start_stat
+                elif start_stat is None:
+                    delta = 0.0
+                rankings.append({
+                    "player_id": pid,
+                    "player_name": p["player_name"] or f"Player {pid}",
+                    "team_id": p["team_id"],
+                    "delta": delta
+                })
+            
+            # Sort by delta descending (best first)
+            rankings.sort(key=lambda x: x["delta"] if x["delta"] is not None else float("-inf"), reverse=True)
+            
+            # Overall rank (1-based)
+            overall_rank = None
+            for i, r in enumerate(rankings, 1):
+                if r["player_id"] == player_id:
+                    overall_rank = i
+                    break
+            
+            # Team rank: filter to same team, sort by delta, find position
+            team_rank = None
+            team_name = None
+            team_rankings = []
+            if participant["team_id"] is not None:
+                teams = await bot.database.get_competition_teams(competition_id)
+                team_names = {t["id"]: t["team_name"] for t in teams}
+                team_name = team_names.get(participant["team_id"], f"Team {participant['team_id']}")
+                team_rankings = [r for r in rankings if r["team_id"] == participant["team_id"]]
+                for i, r in enumerate(team_rankings, 1):
+                    if r["player_id"] == player_id:
+                        team_rank = i
+                        break
+            
+            player_name = participant["player_name"] or f"Player {player_id}"
+            total = len(rankings)
+            
+            embed = discord.Embed(
+                title=f"Competition: {comp['name']}",
+                color=discord.Color.blue(),
+                description=f"**Tracked Stat:** {comp['tracked_stat']}"
+            )
+            embed.add_field(
+                name="Player",
+                value=f"{player_name} [{player_id}]",
+                inline=False
+            )
+            embed.add_field(
+                name="Overall Ranking",
+                value=f"**{overall_rank}** of {total}" if overall_rank else "—",
+                inline=True
+            )
+            team_rank_value = (
+                f"**{team_rank}** of {len(team_rankings)} on {team_name}"
+                if team_rank is not None and participant["team_id"] is not None
+                else ("—" if participant["team_id"] is None else f"— on {team_name}")
+            )
+            embed.add_field(
+                name="Team Ranking",
+                value=team_rank_value,
+                inline=True
+            )
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+            import traceback
+            traceback.print_exc()
 
     @bot.tree.command(name="competition-faction-overview", description="Get overall faction improvement summary")
     @discord.app_commands.describe(
