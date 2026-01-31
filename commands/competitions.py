@@ -1,15 +1,17 @@
 """Competition tracking commands for Discord bot."""
 
+import traceback
 import discord
 from discord.ext import commands
 from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 import random
 import asyncio
 from torn_api import TornAPIClient, TornKeyManager
 from torn_api.client import TornAPIError
 from commands.competition_utils import (
     CONTRIBUTOR_STATS,
+    GYM_STAT_NAMES,
     get_status_emoji,
     check_database_available,
     validate_competition_exists,
@@ -17,6 +19,8 @@ from commands.competition_utils import (
     find_faction_api_key,
     process_faction_members,
     format_number_with_sign,
+    format_roster_lines,
+    compute_participant_delta,
     get_all_faction_keys,
     find_best_key_for_faction
 )
@@ -395,7 +399,6 @@ def setup(bot: commands.Bot):
                 value=(
                     "1. Set team captains using `/competition-team-set-captains`\n"
                     "2. Add participants using `/competition-add-participants`\n"
-                    "3. Participants will be randomly assigned to teams"
                 ),
                 inline=False
             )
@@ -404,7 +407,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-cancel", description="Cancel a competition (Admin only)")
@@ -443,250 +445,12 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-    @bot.tree.command(name="competition-status", description="Get competition status and current rankings")
-    @discord.app_commands.describe(
-        competition_id="ID of the competition",
-        show_worst="Show worst ranks instead of best (default: False)",
-        limit="Number of results to show (default: 10 or all if less)"
-    )
-    async def competition_status(
-        interaction: discord.Interaction,
-        competition_id: int,
-        show_worst: bool = False,
-        limit: Optional[int] = None
-    ):
-        """Get competition status and current rankings."""
-        await interaction.response.defer(ephemeral=True)
-        
-        if not await check_database_available(bot, interaction):
-            return
-        
-        try:
-            comp = await validate_competition_exists(bot, competition_id, interaction)
-            if not comp:
-                return
-            
-            participants = await bot.database.get_competition_participants(competition_id)
-            
-            if not participants:
-                await interaction.followup.send("❌ No participants found for this competition.", ephemeral=True)
-                return
-            
-            # Calculate rankings
-            rankings = []
-            for participant in participants:
-                player_id = participant["player_id"]
-                
-                # Get start stat
-                start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
-                
-                # Get current stat
-                current_stat = await bot.database.get_player_current_stat_value(
-                    player_id, comp["tracked_stat"]
-                )
-                
-                # Calculate delta
-                delta = None
-                if start_stat is not None and current_stat is not None:
-                    delta = current_stat - start_stat
-                elif start_stat is None:
-                    # Use current as start if not set yet
-                    delta = 0.0
-                
-                rankings.append({
-                    "player_id": player_id,
-                    "player_name": participant["player_name"] or f"Player {player_id}",
-                    "team_id": participant["team_id"],
-                    "start_stat": start_stat,
-                    "current_stat": current_stat,
-                    "delta": delta
-                })
-            
-            # Sort by delta (best first, unless show_worst)
-            rankings.sort(key=lambda x: x["delta"] if x["delta"] is not None else float('-inf'), reverse=not show_worst)
-            
-            # Determine how many to show (all or top 10, whichever is less)
-            max_results = limit if limit else min(10, len(rankings))
-            display_rankings = rankings[:max_results]
-            
-            # Build embed
-            status_emoji = get_status_emoji(comp["status"])
-            
-            embed = discord.Embed(
-                title=f"{status_emoji} Competition: {comp['name']}",
-                color=discord.Color.blue(),
-                description=f"**Tracked Stat:** {comp['tracked_stat']}"
-            )
-            
-            start_date_str = datetime.fromtimestamp(comp["start_date"]).strftime("%Y-%m-%d")
-            end_date_str = datetime.fromtimestamp(comp["end_date"]).strftime("%Y-%m-%d")
-            embed.add_field(name="Period", value=f"{start_date_str} to {end_date_str}", inline=False)
-            
-            # Build rankings text
-            rank_type = "Worst" if show_worst else "Top"
-            rankings_text = []
-            
-            for i, rank in enumerate(display_rankings, 1):
-                delta_str = format_number_with_sign(rank['delta'])
-                current_str = f"{rank['current_stat']:,.0f}" if rank['current_stat'] is not None else "N/A"
-                
-                rankings_text.append(
-                    f"**{i}.** {rank['player_name']} [{rank['player_id']}]\n"
-                    f"   Change: {delta_str} | Current: {current_str}"
-                )
-            
-            if rankings_text:
-                embed.add_field(
-                    name=f"{rank_type} {len(display_rankings)} Rankings",
-                    value="\n".join(rankings_text),
-                    inline=False
-                )
-            else:
-                embed.add_field(name="Rankings", value="No data available yet.", inline=False)
-            
-            if len(rankings) > max_results:
-                embed.set_footer(text=f"Showing {max_results} of {len(rankings)} participants")
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
-            traceback.print_exc()
-    
-    @bot.tree.command(name="competition-team-status", description="Get team rankings for a competition")
-    @discord.app_commands.describe(
-        competition_id="ID of the competition",
-        team_id="Team ID (optional, to show specific team)",
-        show_worst="Show worst teams instead of best (default: False)"
-    )
-    async def competition_team_status(
-        interaction: discord.Interaction,
-        competition_id: int,
-        team_id: Optional[int] = None,
-        show_worst: bool = False
-    ):
-        """Get team rankings for a competition."""
-        await interaction.response.defer(ephemeral=True)
-        
-        if not await check_database_available(bot, interaction):
-            return
-        
-        try:
-            comp = await validate_competition_exists(bot, competition_id, interaction)
-            if not comp:
-                return
-            
-            # Get teams
-            teams = await bot.database.get_competition_teams(competition_id)
-            
-            # Filter by team_id if provided
-            if team_id:
-                teams = [t for t in teams if t["id"] == team_id]
-                if not teams:
-                    await interaction.followup.send(f"❌ Team with ID {team_id} not found.", ephemeral=True)
-                    return
-            
-            # Get participants
-            participants = await bot.database.get_competition_participants(competition_id)
-            
-            # Calculate team totals
-            team_totals = {}
-            for team in teams:
-                team_totals[team["id"]] = {
-                    "team_name": team["team_name"],
-                    "captain_1": team["captain_discord_id_1"],
-                    "captain_2": team["captain_discord_id_2"],
-                    "total_delta": 0.0,
-                    "participant_count": 0
-                }
-            
-            # Check if user is admin or captain
-            is_admin = interaction.user.guild_permissions.administrator
-            user_discord_id = str(interaction.user.id)
-            is_captain = False
-            
-            if team_id:
-                team = teams[0]
-                is_captain = (
-                    team["captain_discord_id_1"] == user_discord_id or
-                    team["captain_discord_id_2"] == user_discord_id
-                )
-            
-            # If specific team requested, check permissions
-            if team_id and not (is_admin or is_captain):
-                await interaction.followup.send(
-                    "❌ You must be an admin or team captain to view individual team status.",
-                    ephemeral=True
-                )
-                return
-            
-            # Calculate deltas for each participant and sum by team
-            for participant in participants:
-                if not participant["team_id"]:
-                    continue
-                
-                team_id_key = participant["team_id"]
-                if team_id_key not in team_totals:
-                    continue
-                
-                player_id = participant["player_id"]
-                start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
-                current_stat = await bot.database.get_player_current_stat_value(
-                    player_id, comp["tracked_stat"]
-                )
-                
-                delta = 0.0
-                if start_stat is not None and current_stat is not None:
-                    delta = current_stat - start_stat
-                
-                team_totals[team_id_key]["total_delta"] += delta
-                team_totals[team_id_key]["participant_count"] += 1
-            
-            # Convert to list and sort
-            team_rankings = list(team_totals.values())
-            team_rankings.sort(key=lambda x: x["total_delta"], reverse=not show_worst)
-            
-            # Build embed
-            status_emoji = get_status_emoji(comp["status"])
-            
-            embed = discord.Embed(
-                title=f"{status_emoji} Team Rankings: {comp['name']}",
-                color=discord.Color.blue(),
-                description=f"**Tracked Stat:** {comp['tracked_stat']}"
-            )
-            
-            rank_type = "Worst" if show_worst else "Top"
-            rankings_text = []
-            
-            for i, team in enumerate(team_rankings, 1):
-                delta_str = format_number_with_sign(team['total_delta'])
-                rankings_text.append(
-                    f"**{i}.** {team['team_name']}\n"
-                    f"   Total Change: {delta_str} | Members: {team['participant_count']}"
-                )
-            
-            if rankings_text:
-                embed.add_field(
-                    name=f"{rank_type} Team Rankings",
-                    value="\n".join(rankings_text),
-                    inline=False
-                )
-            else:
-                embed.add_field(name="Team Rankings", value="No team data available.", inline=False)
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
-            traceback.print_exc()
-    
+      
     @bot.tree.command(name="competition-team-roster", description="List players on each team for a competition")
     @discord.app_commands.describe(
         competition_id="ID of the competition",
         team_id="Optional: show only this team's roster",
-        visible="If true, show roster in channel for everyone to see (default: false, only you see it)"
+        visible="If true, show roster in channel for everyone to see"
     )
     async def competition_team_roster(
         interaction: discord.Interaction,
@@ -720,26 +484,14 @@ def setup(bot: commands.Bot):
                     return
                 participants = [p for p in participants if p.get("team_id") == team_id]
             
-            # Fetch start/current stat and delta for each participant (for ranking and "e spent since start")
             tracked_stat = comp.get("tracked_stat") or "gym_e_spent"
-            team_roster = {}  # team_id -> list of {player_name, player_id, delta, current_stat}
+            team_roster = {}  # team_id -> list of {player_name, player_id, delta}
             no_team = []
             for p in participants:
                 player_id = p["player_id"]
                 name = p.get("player_name") or f"Player {player_id}"
-                start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
-                current_stat = await bot.database.get_player_current_stat_value(player_id, tracked_stat)
-                delta = None
-                if start_stat is not None and current_stat is not None:
-                    delta = current_stat - start_stat
-                elif start_stat is None:
-                    delta = 0.0
-                entry = {
-                    "player_name": name,
-                    "player_id": player_id,
-                    "delta": delta,
-                    "current_stat": current_stat,
-                }
+                delta = await compute_participant_delta(bot, competition_id, player_id, tracked_stat)
+                entry = {"player_name": name, "player_id": player_id, "delta": delta}
                 tid = p.get("team_id")
                 if tid is not None:
                     if tid not in team_roster:
@@ -766,36 +518,20 @@ def setup(bot: commands.Bot):
                 description=f"Players on each team, ranked by highest **delta** ({tracked_stat}). Shows change since competition started."
             )
             
-            # One field per team (and one for "No team" if any)
             max_value_len = 1024
             for team in teams:
                 tid = team["id"]
                 roster = team_roster.get(tid, [])
-                team_name = team["team_name"]
-                lines = []
-                for i, m in enumerate(roster, 1):
-                    delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
-                    lines.append(f"{i}. {m['player_name']} [{m['player_id']}] {delta_str}")
-                value = "\n".join(lines) if lines else "*No players assigned*"
-                if len(value) > max_value_len:
-                    value = value[: max_value_len - 20] + "\n... (truncated)"
                 embed.add_field(
-                    name=f"{team_name} ({len(roster)} players)",
-                    value=value,
+                    name=f"{team['team_name']} ({len(roster)} players)",
+                    value=format_roster_lines(roster, max_value_len),
                     inline=False
                 )
             
             if no_team and team_id is None:
-                lines = []
-                for i, m in enumerate(no_team, 1):
-                    delta_str = format_number_with_sign(m["delta"]) if m["delta"] is not None else "N/A"
-                    lines.append(f"{i}. {m['player_name']} [{m['player_id']}] {delta_str}")
-                value = "\n".join(lines)
-                if len(value) > max_value_len:
-                    value = value[: max_value_len - 20] + "\n... (truncated)"
                 embed.add_field(
                     name="No team assigned",
-                    value=value,
+                    value=format_roster_lines(no_team, max_value_len, empty_msg=""),
                     inline=False
                 )
             
@@ -803,7 +539,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-player", description="Get a player's ranking in a competition (overall and on their team)")
@@ -837,19 +572,12 @@ def setup(bot: commands.Bot):
                 )
                 return
             
-            # Build rankings with deltas (same logic as competition_status)
             rankings = []
             for p in participants:
                 pid = p["player_id"]
-                start_stat = await bot.database.get_competition_start_stat(competition_id, pid)
-                current_stat = await bot.database.get_player_current_stat_value(
-                    pid, comp["tracked_stat"]
+                delta = await compute_participant_delta(
+                    bot, competition_id, pid, comp["tracked_stat"]
                 )
-                delta = None
-                if start_stat is not None and current_stat is not None:
-                    delta = current_stat - start_stat
-                elif start_stat is None:
-                    delta = 0.0
                 rankings.append({
                     "player_id": pid,
                     "player_name": p["player_name"] or f"Player {pid}",
@@ -922,75 +650,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
-            traceback.print_exc()
-
-    @bot.tree.command(name="competition-faction-overview", description="Get overall faction improvement summary")
-    @discord.app_commands.describe(
-        competition_id="ID of the competition"
-    )
-    async def competition_faction_overview(
-        interaction: discord.Interaction,
-        competition_id: int
-    ):
-        """Get overall faction improvement summary (regardless of teams)."""
-        await interaction.response.defer(ephemeral=True)
-        
-        if not await check_database_available(bot, interaction):
-            return
-        
-        try:
-            comp = await validate_competition_exists(bot, competition_id, interaction)
-            if not comp:
-                return
-            
-            participants = await bot.database.get_competition_participants(competition_id)
-            
-            if not participants:
-                await interaction.followup.send("❌ No participants found for this competition.", ephemeral=True)
-                return
-            
-            # Calculate totals
-            total_delta = 0.0
-            participant_count = 0
-            participants_with_data = 0
-            
-            for participant in participants:
-                player_id = participant["player_id"]
-                start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
-                current_stat = await bot.database.get_player_current_stat_value(
-                    player_id, comp["tracked_stat"]
-                )
-                
-                if start_stat is not None and current_stat is not None:
-                    delta = current_stat - start_stat
-                    total_delta += delta
-                    participants_with_data += 1
-                
-                participant_count += 1
-            
-            # Build embed
-            status_emoji = get_status_emoji(comp["status"])
-            
-            embed = discord.Embed(
-                title=f"{status_emoji} Faction Overview: {comp['name']}",
-                color=discord.Color.green(),
-                description=f"**Tracked Stat:** {comp['tracked_stat']}"
-            )
-            
-            total_delta_str = format_number_with_sign(total_delta)
-            avg_delta = total_delta / participants_with_data if participants_with_data > 0 else 0.0
-            avg_delta_str = format_number_with_sign(avg_delta)
-            
-            embed.add_field(name="Total Improvement", value=total_delta_str, inline=True)
-            embed.add_field(name="Average per Participant", value=avg_delta_str, inline=True)
-            embed.add_field(name="Participants", value=f"{participant_count} total\n{participants_with_data} with data", inline=True)
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
 
     @bot.tree.command(name="competition-team-set-captains", description="Set captains for a competition team (Admin only)")
@@ -1042,7 +701,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-add-participants", description="Add participants from a faction to a competition and randomly assign to teams (Admin only)")
@@ -1174,7 +832,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-update-assignment", description="Update a participant's team assignment (Admin only)")
@@ -1232,7 +889,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-update-stats", description="Manually trigger stat update for active competitions (Admin only)")
@@ -1247,9 +903,6 @@ def setup(bot: commands.Bot):
             return
         
         try:
-            # This will trigger the same update function used by the scheduled task
-            # We'll implement the actual update logic in a shared function
-            # For now, just acknowledge the command
             embed = discord.Embed(
                 title="⏳ Stats Update Started",
                 color=discord.Color.blue(),
@@ -1267,7 +920,6 @@ def setup(bot: commands.Bot):
             )
             competitions_updated_count = result.get("competitions_updated", 0)
             participants_updated_count = result.get("participants_updated", 0)
-            participants_failed_count = result.get("participants_failed_count", 0)
             factions_processed = result.get("factions_processed", 0)
             
             result_embed.add_field(name="Competitions", value=str(competitions_updated_count), inline=True)
@@ -1311,31 +963,6 @@ def setup(bot: commands.Bot):
                     inline=False
                 )
             
-            # Add failed participants details if any
-            failed_participants = result.get("participants_failed", [])
-            if failed_participants:
-                # Group by reason for cleaner display
-                reasons = {}
-                for fail in failed_participants:
-                    reason = fail.get("reason", "Unknown error")
-                    if reason not in reasons:
-                        reasons[reason] = []
-                    reasons[reason].append(fail["player_id"])
-                
-                failure_details = []
-                for reason, player_ids in reasons.items():
-                    if len(player_ids) <= 3:
-                        ids_str = ", ".join(map(str, player_ids))
-                    else:
-                        ids_str = f"{', '.join(map(str, player_ids[:3]))} and {len(player_ids) - 3} more"
-                    failure_details.append(f"**{reason}**\nPlayers: {ids_str}")
-                
-                result_embed.add_field(
-                    name="⚠️ Failed Participants",
-                    value="\n\n".join(failure_details[:3]),  # Show first 3 failure types
-                    inline=False
-                )
-            
             # Set embed color based on results
             if participants_updated_count > 0 and len(failed_factions) == 0:
                 result_embed.color = discord.Color.green()
@@ -1348,7 +975,6 @@ def setup(bot: commands.Bot):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
     
     @bot.tree.command(name="competition-progress", description="Show competition progress graph (visible to channel)")
@@ -1412,32 +1038,17 @@ def setup(bot: commands.Bot):
                 await interaction.followup.send(embed=embed)
                 return
             
-            # Limit entries
             display_data = table_data[:limit] if limit else table_data
-            
-            # Create progress visualization
-            if view_type == "team":
-                # Team view - show progress bars
-                progress_text = _create_progress_bars(display_data, "team")
-                # Discord field value limit is 1024 characters
-                if len(progress_text) > 1024:
-                    progress_text = progress_text[:1021] + "..."
-                embed.add_field(
-                    name=f"🏆 Top {len(display_data)} Teams",
-                    value=progress_text,
-                    inline=False
-                )
-            else:
-                # Individual view - show progress bars
-                progress_text = _create_progress_bars(display_data, "individual")
-                # Discord field value limit is 1024 characters
-                if len(progress_text) > 1024:
-                    progress_text = progress_text[:1021] + "..."
-                embed.add_field(
-                    name=f"👤 Top {len(display_data)} Participants",
-                    value=progress_text,
-                    inline=False
-                )
+            field_emoji = "🏆" if view_type == "team" else "👤"
+            field_label = "Teams" if view_type == "team" else "Participants"
+            progress_text = _create_progress_bars(
+                display_data, view_type, max_len=1024
+            )
+            embed.add_field(
+                name=f"{field_emoji} Top {len(display_data)} {field_label}",
+                value=progress_text,
+                inline=False
+            )
             
             # Add summary stats
             if table_data:
@@ -1456,16 +1067,10 @@ def setup(bot: commands.Bot):
                     inline=True
                 )
             
-            # Add note about data points
-            total_data_points = sum(row.get('data_points', 0) for row in table_data)
-            if total_data_points > 0:
-                embed.set_footer(text=f"Total data points: {total_data_points} | Use /competition-update-stats to refresh")
-            
             await interaction.followup.send(embed=embed)
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-            import traceback
             traceback.print_exc()
 
 
@@ -1502,9 +1107,8 @@ async def _get_competition_progress_data(
         start_stat = await bot.database.get_competition_start_stat(competition_id, player_id)
         start_stats[player_id] = start_stat if start_stat is not None else 0.0
     
-    # Get historical data
     if tracked_stat == "gym_e_spent":
-        stat_names = ["gymstrength", "gymdefense", "gymspeed", "gymdexterity"]
+        stat_names = list(GYM_STAT_NAMES)
     else:
         stat_names = [tracked_stat]
     
@@ -1615,12 +1219,12 @@ async def _get_competition_progress_data(
     }
 
 
-def _create_progress_bars(data: List[Dict[str, Any]], view_type: str) -> str:
-    """Create text-based progress bars for Discord embed."""
+def _create_progress_bars(
+    data: List[Dict[str, Any]], view_type: str, max_len: int = 1024
+) -> str:
+    """Create text-based progress bars for Discord embed, truncated to max_len."""
     if not data:
         return "No data available"
-    
-    # Find max absolute value for scaling
     max_abs = max(abs(row['latest_progress']) for row in data)
     if max_abs == 0:
         max_abs = 1  # Avoid division by zero
@@ -1661,7 +1265,10 @@ def _create_progress_bars(data: List[Dict[str, Any]], view_type: str) -> str:
         
         lines.append(f"{i}. {emoji} **{name}**{team_info}\n`{bar}` {value_str}")
     
-    return "\n\n".join(lines)
+    result = "\n\n".join(lines)
+    if len(result) > max_len:
+        result = result[:max_len - 20] + "\n... (truncated)"
+    return result
 
 
 async def _process_faction_contributors_data(
@@ -1753,9 +1360,8 @@ async def _collect_contributor_stats_for_competition(
     factions_failed = []
     participants_failed = participants_without_faction.copy()
     
-    # Determine which stats to fetch
     if tracked_stat == "gym_e_spent":
-        stats_to_fetch = ["gymstrength", "gymspeed", "gymdefense", "gymdexterity"]
+        stats_to_fetch = list(GYM_STAT_NAMES)
     else:
         stats_to_fetch = [tracked_stat]
     
@@ -1763,10 +1369,7 @@ async def _collect_contributor_stats_for_competition(
     for faction_id, faction_participants in participants_by_faction.items():
         participant_player_ids = {p["player_id"] for p in faction_participants}
         
-        # Find best key for this faction (prefer key from same faction)
-        selected_key = find_best_key_for_faction(all_keys, key_manager, faction_id, key_owner_factions)
-        
-        if not selected_key:
+        if not find_best_key_for_faction(all_keys, key_manager, faction_id, key_owner_factions):
             factions_failed.append({
                 "faction_id": faction_id,
                 "reason": "No API key with faction permission available",
@@ -1940,7 +1543,6 @@ async def _collect_contributor_stats_for_competition(
                 
             except Exception as e:
                 last_error = f"Unexpected error: {str(e)}"
-                import traceback
                 print(f"Error processing faction {faction_id}: {e}")
                 traceback.print_exc()
                 continue  # Try next key
@@ -2067,7 +1669,6 @@ async def _update_competition_stats_helper(bot: commands.Bot) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        import traceback
         traceback.print_exc()
         return {
             "error": str(e),

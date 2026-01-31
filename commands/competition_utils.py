@@ -44,6 +44,9 @@ CONTRIBUTOR_STATS = [
     "caymaninterest"
 ]
 
+# Gym stats that sum to gym_e_spent (order matches API)
+GYM_STAT_NAMES = ["gymstrength", "gymdefense", "gymspeed", "gymdexterity"]
+
 
 def get_status_emoji(status: str) -> str:
     """Get emoji for competition status.
@@ -219,6 +222,25 @@ async def process_faction_members(
             continue
 
 
+async def compute_participant_delta(
+    bot: commands.Bot,
+    competition_id: int,
+    player_id: int,
+    tracked_stat: str
+) -> Optional[float]:
+    """Compute delta (current - start) for a competition participant.
+    
+    Returns None if both start and current are unavailable; 0.0 if start is not set yet.
+    """
+    start = await bot.database.get_competition_start_stat(competition_id, player_id)
+    current = await bot.database.get_player_current_stat_value(player_id, tracked_stat)
+    if start is not None and current is not None:
+        return current - start
+    if start is None:
+        return 0.0
+    return None
+
+
 def format_number_with_sign(value: Optional[float]) -> str:
     """Format a number with + sign if positive, or as-is if negative/zero.
     
@@ -233,6 +255,21 @@ def format_number_with_sign(value: Optional[float]) -> str:
     if value >= 0:
         return f"+{value:,.0f}"
     return f"{value:,.0f}"
+
+
+def format_roster_lines(
+    members: List[Dict[str, Any]],
+    max_len: int = 1024,
+    empty_msg: str = "*No players assigned*"
+) -> str:
+    """Format a list of roster members into embed-ready text with truncation."""
+    lines = [
+        f"{i}. {m['player_name']} [{m['player_id']}] "
+        f"{format_number_with_sign(m.get('delta')) if m.get('delta') is not None else 'N/A'}"
+        for i, m in enumerate(members, 1)
+    ]
+    value = "\n".join(lines) if lines else empty_msg
+    return value[:max_len - 20] + "\n... (truncated)" if len(value) > max_len else value
 
 
 async def get_all_faction_keys(
