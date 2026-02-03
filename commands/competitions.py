@@ -1470,6 +1470,7 @@ async def _collect_contributor_stats_for_competition(
                 
                 for participant in faction_participants:
                     player_id = participant["player_id"]
+                    start_stat = await bot.database.get_competition_start_stat(comp["id"], player_id)
                     
                     if tracked_stat == "gym_e_spent":
                         # Calculate sum for this player
@@ -1480,51 +1481,53 @@ async def _collect_contributor_stats_for_competition(
                             if gym_stat in stat_values and player_id in stat_values[gym_stat]:
                                 value = stat_values[gym_stat][player_id]
                                 total_e += value
-                                # Store individual gym stat in history
-                                await bot.database.append_player_contributor_history(
-                                    player_id=player_id,
-                                    stat_name=gym_stat,
-                                    value=value,
-                                    faction_id=faction_id,
-                                    data_source=masked_key,
-                                    timestamp=timestamp
-                                )
                             else:
                                 all_stats_present = False
                                 break
                         
                         if all_stats_present:
                             final_value = total_e
-                            # Store sum in history
-                            await bot.database.append_player_contributor_history(
-                                player_id=player_id,
-                                stat_name="gym_e_spent",
-                                value=final_value,
-                                faction_id=faction_id,
-                                data_source=masked_key,
-                                timestamp=timestamp
-                            )
+                            # Only insert history if value is greater than start (avoids midnight reset dips)
+                            if start_stat is None or final_value > start_stat:
+                                for gym_stat in stats_to_fetch:
+                                    value = stat_values[gym_stat][player_id]
+                                    await bot.database.append_player_contributor_history(
+                                        player_id=player_id,
+                                        stat_name=gym_stat,
+                                        value=value,
+                                        faction_id=faction_id,
+                                        data_source=masked_key,
+                                        timestamp=timestamp
+                                    )
+                                await bot.database.append_player_contributor_history(
+                                    player_id=player_id,
+                                    stat_name="gym_e_spent",
+                                    value=final_value,
+                                    faction_id=faction_id,
+                                    data_source=masked_key,
+                                    timestamp=timestamp
+                                )
                         else:
                             final_value = None
                     else:
                         # Single stat
                         if tracked_stat in stat_values and player_id in stat_values[tracked_stat]:
                             final_value = stat_values[tracked_stat][player_id]
-                            # Store in history
-                            await bot.database.append_player_contributor_history(
-                                player_id=player_id,
-                                stat_name=tracked_stat,
-                                value=final_value,
-                                faction_id=faction_id,
-                                data_source=masked_key,
-                                timestamp=timestamp
-                            )
+                            # Only insert history if value is greater than start (avoids midnight reset dips)
+                            if start_stat is None or final_value > start_stat:
+                                await bot.database.append_player_contributor_history(
+                                    player_id=player_id,
+                                    stat_name=tracked_stat,
+                                    value=final_value,
+                                    faction_id=faction_id,
+                                    data_source=masked_key,
+                                    timestamp=timestamp
+                                )
                         else:
                             final_value = None
                     
                     # Update start stat if not set and competition has started
                     if final_value is not None:
-                        start_stat = await bot.database.get_competition_start_stat(comp["id"], player_id)
                         if start_stat is None and now_utc >= comp["start_date"]:
                             await bot.database.set_competition_start_stat(
                                 comp["id"], player_id, final_value, stat_source="contributors"

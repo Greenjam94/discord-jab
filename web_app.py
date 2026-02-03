@@ -1726,13 +1726,13 @@ async def get_competition_progress_data_async(
                 if team_id_p not in team_data:
                     team_data[team_id_p] = {}
                 
-                # Get cumulative values over time
+                # Get cumulative values over time (clamp progress to non-negative:
+                # bad/midnight values can store value < start_stat)
                 if player_id in history_data:
                     cumulative = start_stat
                     for timestamp, value in history_data[player_id]:
-                        cumulative = value  # Current value at this timestamp
-                        progress = cumulative - start_stat
-                        
+                        cumulative = value
+                        progress = max(0.0, cumulative - start_stat)
                         if timestamp not in team_data[team_id_p]:
                             team_data[team_id_p][timestamp] = 0.0
                         team_data[team_id_p][timestamp] += progress
@@ -1752,12 +1752,14 @@ async def get_competition_progress_data_async(
                 team_name = team_map.get(team_id_p, f"Team {team_id_p}") if team_id_p else "No Team"
                 timestamps_dict = team_data[team_id_p]
                 
-                # Build values array aligned to all_timestamps
+                # Build values array; carry forward if value drops (e.g. bad/midnight data)
                 values = []
                 last_value = 0.0
                 for ts in all_timestamps:
                     if ts in timestamps_dict:
-                        last_value = timestamps_dict[ts]
+                        v = timestamps_dict[ts]
+                        if v >= last_value:
+                            last_value = v
                     values.append(last_value)
                 
                 if values:
@@ -1806,14 +1808,17 @@ async def get_competition_progress_data_async(
                     # Build a dict for quick lookup
                     data_dict = {ts: val for ts, val in history_data[player_id]}
                     
-                    # Build values array aligned to all_timestamps
+                    # Build values array; clamp progress and carry forward on drops
                     values = []
                     last_value = start_stat
+                    last_progress = 0.0
                     for ts in all_timestamps:
                         if ts in data_dict:
                             last_value = data_dict[ts]
-                        # Progress = current - start
-                        progress = last_value - start_stat
+                        progress = max(0.0, last_value - start_stat)
+                        if progress < last_progress:
+                            progress = last_progress
+                        last_progress = progress
                         values.append(progress)
                     
                     if values:
