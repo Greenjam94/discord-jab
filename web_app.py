@@ -1870,6 +1870,90 @@ def get_competition_progress_data_sync(
         loop.close()
 
 
+def build_competition_rank_progress_data(table_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build scatter plot and legend table data from individual progress table_data.
+
+    X axis = rank within team (1st, 2nd, 3rd...). Y axis = progress.
+    Same color per team. Returns scatter datasets and legend table (rows=progress, cols=ranks).
+    """
+    if not table_data:
+        return {
+            'scatter_datasets': [],
+            'legend_columns': [],
+            'legend_rows': [],
+            'legend_cells': {},
+        }
+    # Group by team and assign ranks (1 = highest progress)
+    team_to_players: Dict[str, List[Dict[str, Any]]] = {}
+    for row in table_data:
+        team_name = row.get('team', 'No Team')
+        if team_name not in team_to_players:
+            team_to_players[team_name] = []
+        team_to_players[team_name].append(row)
+    for team_name in team_to_players:
+        team_to_players[team_name].sort(key=lambda x: x['latest_progress'], reverse=True)
+    # Assign consistent colors per team
+    team_names = sorted(team_to_players.keys())
+    team_colors = {
+        name: f'hsl({hash(name) % 360}, 70%, 55%)'
+        for name in team_names
+    }
+    # Build scatter datasets (one per team)
+    scatter_datasets = []
+    for team_name in team_names:
+        players = team_to_players[team_name]
+        points = [
+            {'x': rank, 'y': round(p['latest_progress'], 2)}
+            for rank, p in enumerate(players, start=1)
+        ]
+        if points:
+            scatter_datasets.append({
+                'label': team_name,
+                'data': points,
+                'backgroundColor': team_colors[team_name],
+                'borderColor': team_colors[team_name],
+                'pointRadius': 8,
+                'pointHoverRadius': 10,
+            })
+    # Build legend: columns = ranks, rows = progress, cells = player names
+    # Collect all (rank, progress, player_name) and unique progress values
+    rank_progress_players: List[Tuple[int, float, str]] = []
+    progress_values = set()
+    for team_name in team_names:
+        for rank, p in enumerate(team_to_players[team_name], start=1):
+            progress = p['latest_progress']
+            progress_values.add(progress)
+            rank_progress_players.append((rank, progress, p['name']))
+    max_rank = max(r for r, _, _ in rank_progress_players) if rank_progress_players else 0
+    def _ordinal(n: int) -> str:
+        if 10 <= n % 100 <= 20:
+            return f"{n}th"
+        return f"{n}{'st' if n % 10 == 1 else 'nd' if n % 10 == 2 else 'rd' if n % 10 == 3 else 'th'}"
+    legend_columns = [_ordinal(i) for i in range(1, max_rank + 1)]
+    sorted_progress = sorted(progress_values, reverse=True)
+    # Map (progress, rank) -> list of player names
+    cell_map: Dict[Tuple[float, int], List[str]] = {}
+    for rank, progress, player_name in rank_progress_players:
+        key = (progress, rank)
+        if key not in cell_map:
+            cell_map[key] = []
+        cell_map[key].append(player_name)
+    legend_rows = [(p, f"{p:,.2f}") for p in sorted_progress]
+    legend_cells = {}
+    for progress, _ in legend_rows:
+        for rank in range(1, max_rank + 1):
+            key = (progress, rank)
+            players = cell_map.get(key, [])
+            legend_cells[key] = ", ".join(players) if players else ""
+    return {
+        'scatter_datasets': scatter_datasets,
+        'legend_columns': legend_columns,
+        'legend_rows': legend_rows,
+        'legend_cells': legend_cells,
+        'max_rank': max_rank,
+    }
+
+
 async def get_competition_stats_history_table_async(competition_id: int) -> Dict[str, Any]:
     """Get full competition player stats history as table data (rows = timestamps, columns = players).
     
@@ -2076,6 +2160,11 @@ def competition_progress(competition_id: int):
                             </tr>
                             ''')
     
+    # Build rank-progress scatter data and legend (individual view only)
+    rank_data = None
+    if view_type == 'individual' and progress_data.get('table_data'):
+        rank_data = build_competition_rank_progress_data(progress_data['table_data'])
+    
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -2278,6 +2367,34 @@ def competition_progress(competition_id: int):
                 </div>
             </div>
             
+            {f'''
+            <div class="chart-container">
+                <h3 style="color: #4ec9b0; margin-bottom: 15px;">Competition Standings by Rank</h3>
+                <p class="subtitle" style="margin-bottom: 15px;">X = rank within team (1st=top contributor), Y = progress. Same color = same team.</p>
+                <div class="chart-wrapper">
+                    <canvas id="rankProgressChart"></canvas>
+                </div>
+                <div class="table-container" style="margin-top: 20px;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Progress</th>
+                                {''.join(f'<th>{c}</th>' for c in rank_data['legend_columns'])}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {''.join(
+                                f'<tr><td class="number">{row_label}</td>'
+                                + ''.join(f'<td>{rank_data["legend_cells"].get((progress, r+1), "")}</td>' for r in range(rank_data["max_rank"]))
+                                + '</tr>'
+                                for progress, row_label in rank_data['legend_rows']
+                            )}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            ''' if rank_data and rank_data['scatter_datasets'] else ''}
+            
             <div class="table-container">
                 <table>
                     <thead>
@@ -2369,6 +2486,44 @@ def competition_progress(competition_id: int):
                     }}
                 }}
             }});
+            {f'''
+            var rankCtx = document.getElementById('rankProgressChart');
+            if (rankCtx) {{
+                new Chart(rankCtx.getContext('2d'), {{
+                    type: 'scatter',
+                    data: {{ datasets: {json.dumps(rank_data['scatter_datasets'])} }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {{
+                            legend: {{ display: true, position: 'top', labels: {{ color: '#d4d4d4' }} }},
+                            title: {{ display: true, text: 'Progress by Rank (within team)', color: '#4ec9b0' }},
+                            tooltip: {{
+                                callbacks: {{
+                                    label: function(ctx) {{
+                                        return ctx.dataset.label + ': ' + ctx.raw.y.toLocaleString() + ' (rank ' + ctx.raw.x + ')';
+                                    }}
+                                }},
+                                backgroundColor: '#252526', titleColor: '#4ec9b0', bodyColor: '#d4d4d4'
+                            }}
+                        }},
+                        scales: {{
+                            x: {{
+                                title: {{ display: true, text: 'Rank within team', color: '#858585' }},
+                                min: 0.5, max: {rank_data['max_rank'] + 0.5},
+                                ticks: {{ stepSize: 1, color: '#858585' }},
+                                grid: {{ color: '#3e3e42' }}
+                            }},
+                            y: {{
+                                title: {{ display: true, text: 'Progress ({comp["tracked_stat"]})', color: '#858585' }},
+                                ticks: {{ color: '#858585' }},
+                                grid: {{ color: '#3e3e42' }}
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+            ''' if rank_data and rank_data['scatter_datasets'] else ''}
         </script>
     </body>
     </html>
