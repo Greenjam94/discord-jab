@@ -1903,7 +1903,7 @@ def build_competition_rank_progress_data(table_data: List[Dict[str, Any]]) -> Di
     for team_name in team_names:
         players = team_to_players[team_name]
         points = [
-            {'x': rank, 'y': round(p['latest_progress'], 2)}
+            {'x': rank, 'y': round(p['latest_progress'], 2), 'playerName': p['name']}
             for rank, p in enumerate(players, start=1)
         ]
         if points:
@@ -2501,7 +2501,10 @@ def competition_progress(competition_id: int):
                             tooltip: {{
                                 callbacks: {{
                                     label: function(ctx) {{
-                                        return ctx.dataset.label + ': ' + ctx.raw.y.toLocaleString() + ' (rank ' + ctx.raw.x + ')';
+                                        var team = ctx.dataset.label;
+                                        var rank = ctx.raw.x;
+                                        var player = ctx.raw.playerName || 'Unknown';
+                                        return team + ' #' + rank + ' ' + player + ' (' + ctx.raw.y.toLocaleString() + ')';
                                     }}
                                 }},
                                 backgroundColor: '#252526', titleColor: '#4ec9b0', bodyColor: '#d4d4d4'
